@@ -12,8 +12,9 @@ Current implementation:
 - Script: `analysis/failure_signal_analyzer.py`
 - Detailed output: `analysis/failure_signals.csv`
 - Summary output: `analysis/failure_signal_summary.csv`
-- Scope: low-complexity mechanical signals that do not require trajectory parsing.
+- Scope: low-to-medium-complexity mechanical signals that do not require trajectory parsing.
 - Validation: signal failure rates are computed only where an official `traj/*/eval_results.json` result map is available.
+- Path policy: `tests_only_patch` is strict and only uses benchmark `test_patch` files; `production_code_not_touched` is broader and also treats obvious test paths, docs, and generated/vendor files as non-production.
 
 ## Mechanical Failure Signals
 
@@ -22,7 +23,7 @@ Current implementation:
 | [x] | `no_patch` | No generated patch artifact exists for the attempt. | Agent artifacts | Very high | Low |
 | [x] | `empty_or_tiny_patch` | Generated patch is empty or below a small LOC threshold. | Generated patch | Very high | Low |
 | [ ] | `patch_application_or_editing_failure` | Patch is malformed, cannot be applied, or produces mechanically inconsistent edits. | Generated patch, base repo | High | Medium |
-| [ ] | `syntax_or_parse_error` | Eval output reports syntax, parse, import, compile, or equivalent language-level failure. | Eval output/logs | High if logs are structured | Medium |
+| [x] | `syntax_or_parse_error` | Eval output reports syntax, parse, import, compile, or equivalent language-level failure. | Eval output/logs | High if logs are structured | Medium |
 | [x] | `test_failure_available` | Public eval output contains at least one failed test. | Eval output | Very high | Low |
 | [x] | `missing_output` | No eval output artifact is available for the attempt. | Eval artifacts | Very high | Low |
 | [x] | `wrong_files_touched` | Generated patch touches files with no overlap with gold patch files. | Gold patch, generated patch | High | Low |
@@ -36,16 +37,15 @@ Current implementation:
 | [x] | `multi_file_gold_patch` | Gold patch changes more than one file. | Gold patch | Very high | Low |
 | [x] | `single_file_gold_patch` | Gold patch changes exactly one file. | Gold patch | Very high | Low |
 | [x] | `generated_patch_multi_file` | Generated patch changes more than one file. | Generated patch | Very high | Low |
-| [ ] | `production_code_not_touched` | Generated patch avoids production-code paths and only touches non-production areas. | Generated patch, repo path rules | Medium-high | Medium |
+| [x] | `production_code_not_touched` | Generated patch avoids production-code paths and only touches non-production areas. | Generated patch, repo path rules | Medium-high | Medium |
 | [x] | `tests_only_patch` | Generated patch only changes files from the benchmark `test_patch`. | Generated patch, benchmark `test_patch` | Very high | Low |
 | [x] | `docs_only_patch` | Generated patch only changes documentation files. | Generated patch, path rules | High | Low |
 | [ ] | `config_only_patch` | Generated patch only changes config/build/metadata files. | Generated patch, path rules | Medium-high | Medium |
-| [ ] | `generated_or_vendor_churn` | Generated patch changes generated, vendor, lockfile, or bundled files. | Generated patch, path rules | Medium-high | Medium |
+| [x] | `generated_or_vendor_churn` | Generated patch changes generated, vendor, lockfile, or bundled files. | Generated patch, path rules | Medium-high | Medium |
 | [ ] | `required_interface_missing` | Issue explicitly names an interface, method, class, endpoint, or function that is absent from the generated patch. | Problem statement, generated patch | Medium-high when interfaces are explicit | Medium-high |
-| [ ] | `required_file_missing` | Issue or gold patch identifies a required file/path that the generated patch does not touch. | Problem statement, gold patch, generated patch | High for gold files; medium for issue text | Medium |
-| [ ] | `required_test_target_still_failing` | A `FAIL_TO_PASS` test is still failing after applying the generated patch. | `FAIL_TO_PASS`, eval output | Very high | Medium |
-| [ ] | `regression_test_failed` | A `PASS_TO_PASS` test fails after applying the generated patch. | `PASS_TO_PASS`, eval output | Very high | Medium |
-| [ ] | `new_tests_not_exercised_or_missing_output` | Expected target tests are absent from eval output or no useful output is available. | `FAIL_TO_PASS`, eval output | High | Medium |
+| [x] | `required_test_target_still_failing` | A `FAIL_TO_PASS` test is still failing after applying the generated patch. | `FAIL_TO_PASS`, eval output | Very high | Medium |
+| [x] | `regression_test_failed` | A `PASS_TO_PASS` test fails after applying the generated patch. | `PASS_TO_PASS`, eval output | Very high | Medium |
+| [x] | `new_tests_not_exercised_or_missing_output` | Expected target tests are absent from eval output or no useful output is available. | `FAIL_TO_PASS`, eval output | High | Medium |
 | [ ] | `trajectory_no_submission` | Trajectory never reaches a submit/final-answer action. | Trajectory | High if actions are structured | Medium |
 | [ ] | `trajectory_stuck_loop` | Trajectory repeats similar actions or observations beyond a fixed threshold. | Trajectory | Medium-high | Medium-high |
 | [ ] | `trajectory_tool_error` | Trajectory records tool failures, command errors, or API/tool invocation errors. | Trajectory | High if errors are structured | Medium |
@@ -53,7 +53,7 @@ Current implementation:
 | [ ] | `trajectory_never_opened_gold_files` | Agent never inspected files changed by the gold patch. | Trajectory, gold patch | Medium-high | Medium-high |
 | [ ] | `trajectory_opened_but_did_not_edit_gold_files` | Agent inspected gold files but did not modify them. | Trajectory, gold patch, generated patch | Medium-high | Medium-high |
 | [ ] | `trajectory_edited_wrong_subsystem` | Agent repeatedly inspected or edited paths outside the gold-patch subsystem. | Trajectory, gold patch, path rules | Medium as a heuristic | Medium-high |
-| [ ] | `eval_passed_but_result_false_mismatch` | Eval output appears successful but the result map marks the instance unresolved. | Eval result map, eval output | High for mismatch detection | Medium |
+| [x] | `eval_passed_but_result_false_mismatch` | Eval output appears successful but the result map marks the instance unresolved. | Eval result map, eval output | High for mismatch detection | Medium |
 
 ## Reviewed Failure Causes
 
@@ -61,7 +61,7 @@ Current implementation:
 |---|---|---|---|---|---|---|
 | [ ] | `overbroad_refactor` | Patch makes broad, unrelated, or unfocused changes instead of the narrow fix required. | Candidate only | `generated_patch_too_large`, `large_refactor`, `extra_files_touched`, `generated_or_vendor_churn` | Medium | Medium |
 | [ ] | `incomplete_implementation` | Patch targets relevant code but implements only part of the required behavior. | Candidate only | `partial_file_overlap`, `missing_gold_files`, `generated_patch_too_small`, failed `FAIL_TO_PASS` tests | Medium | Medium |
-| [ ] | `multi_file_coordination_failure` | Patch finds part of the right area but misses required files, wiring, generated artifacts, fixtures, schema/docs, or integration points. | Candidate only, often strong | `multi_file_gold_patch`, `partial_file_overlap`, `missing_gold_files`, required interface/file missing | Medium-high | Medium |
+| [ ] | `multi_file_coordination_failure` | Patch finds part of the right area but misses required files, wiring, generated artifacts, fixtures, schema/docs, or integration points. | Candidate only, often strong | `multi_file_gold_patch`, `partial_file_overlap`, `missing_gold_files`, required interface missing | Medium-high | Medium |
 | [ ] | `wrong_subsystem_targeted` | Patch edits the wrong package, module, test/config area, generated artifact, or subsystem. | Candidate only | `wrong_files_touched`, low path overlap, `production_code_not_touched`, `tests_only_patch` | Medium-high | Medium |
 | [ ] | `framework_api_misunderstanding` | Patch misunderstands framework conventions, project APIs, generated-code flow, or language-specific behavior. | Not reliably deterministic | Syntax/import errors, failed tests, trajectory notes, edits near framework integration points | Low-medium | High |
 | [ ] | `patch_application_or_editing_failure` | Patch is malformed, misplaced, inconsistent, or fails mechanically during apply/build. | Often deterministic | Patch apply failure, syntax/parse error, malformed diff, broken generated files | High | Medium |
@@ -119,13 +119,12 @@ Common preprocessing:
 | `multi_file_gold_patch` | Emit if gold patch file count is `>1`. |
 | `single_file_gold_patch` | Emit if gold patch file count is `1`. |
 | `generated_patch_multi_file` | Emit if generated patch file count is `>1`. |
-| `production_code_not_touched` | Classify paths with repository-specific and generic rules. Emit if generated patch has no production paths and only touches tests/docs/config/generated/vendor. Generic examples: production is usually outside `test`, `tests`, `spec`, `docs`, `.github`, lockfiles, snapshots, generated folders. |
+| `production_code_not_touched` | Classify paths with conservative generic rules. Emit if generated patch has no production paths and only touches benchmark test files, obvious test paths, docs, or generated/vendor files. Config/build metadata is intentionally excluded until repo-specific rules exist. |
 | `tests_only_patch` | Parse files from the benchmark `test_patch`. Emit only if every generated path is contained in that `test_patch` file set. No generic path-name fallback is used. |
 | `docs_only_patch` | Emit if every generated path matches docs-only rules, e.g. `docs/`, `doc/`, `README*`, `*.md`, `*.rst`, `*.asciidoc`. |
-| `config_only_patch` | Emit if every generated path is config/build/metadata, e.g. YAML/TOML/JSON config, package metadata, CI files, Dockerfiles, lockfiles. Use conservative path allowlists to avoid false positives. |
+| `config_only_patch` | Currently not implemented. A robust version should avoid global filename allowlists and prefer repo-specific path rules plus gold-patch context. Emit only when changed files are explicitly known to be build/CI/tooling metadata for that repo and are not benchmark-relevant gold files. |
 | `generated_or_vendor_churn` | Emit if generated patch touches likely generated/vendor files, e.g. `vendor/`, `dist/`, `build/`, generated API clients, snapshots, lockfiles, minified bundles. Flag as churn if these files are extra relative to gold or dominate changed LOC. |
 | `required_interface_missing` | Extract explicit interfaces from the benchmark row. Prefer the `New interfaces introduced` section in `problem_statement`; also regex names after `Name:`, backticked symbols, function/class declarations, endpoint paths. Emit if the generated patch does not add or modify code containing the required symbol/path. |
-| `required_file_missing` | Combine gold files and explicit file paths in the issue text. Emit if a required path is absent from generated patch. For issue-derived paths, only use high-confidence path-like strings. |
 | `required_test_target_still_failing` | Normalize `FAIL_TO_PASS` names from the dataset and compare to failed tests in `_output.json`. Emit if any target test is still failing. |
 | `regression_test_failed` | Normalize `PASS_TO_PASS` names and compare to failed tests. Emit if a regression test fails. |
 | `new_tests_not_exercised_or_missing_output` | Emit if `FAIL_TO_PASS` exists but none of those tests appear in output, or if output is missing. This catches incomplete eval artifacts or test-selection problems. |
