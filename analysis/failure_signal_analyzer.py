@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Compute no-trajectory SWE-Bench Pro failure signals."""
+"""Compute mechanical SWE-Bench Pro failure signals."""
 
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import re
 from pathlib import Path
 
 
@@ -33,6 +34,9 @@ SIGNALS = [
     "required_test_target_still_failing",
     "regression_test_failed",
     "new_tests_not_exercised_or_missing_output",
+    "trajectory_no_submission",
+    "trajectory_tool_error",
+    "trajectory_timeout_or_turn_limit",
     "eval_passed_but_result_false_mismatch",
 ]
 
@@ -49,6 +53,8 @@ FIELDNAMES = [
     "extra_file_count",
     "failed_fail_to_pass_count",
     "failed_pass_to_pass_count",
+    "trajectory_available",
+    "trajectory_tool_error_count",
     *SIGNALS,
 ]
 
@@ -65,6 +71,34 @@ SYNTAX_ERROR_PATTERNS = [
     "ts2339",
     "error: cannot find symbol",
     "undefined reference",
+]
+
+TOOL_ERROR_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bcommand failed\b",
+        r"\bcommand timed out\b",
+        r"\b(?:process|command) (?:exited|returned) with (?:exit )?code [1-9]\d*\b",
+        r"\bnon[- ]zero exit(?: code| status)?\b",
+        r"\bno such file or directory\b",
+        r"\bfile not found\b",
+        r"\bpermission denied\b",
+        r"\btool (?:call |invocation )?(?:error|failed)\b",
+        r"\binvalid tool (?:call|arguments?)\b",
+    )
+]
+
+TERMINATION_PATTERNS = [
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\b(?:cost|token|time|turn|step) limit\b",
+        r"\b(?:cost|token|time|turn|step) budget\b",
+        r"\bmax(?:imum)?[ _-]?(?:turns?|steps?|tokens?)\b",
+        r"\bcontext window\b",
+        r"\bcommand timeouts?\b",
+        r"\btimed out\b",
+        r"\btimeout\b",
+    )
 ]
 
 ##########################################
@@ -244,11 +278,77 @@ def read_attempt_text(attempt_dir: Path, output_text: str) -> str:
     return "\n".join(chunks)
 
 
+def find_trajectory_path(root: Path, run: str, instance_id: str) -> Path | None:
+    # SWE-Agent stores one JSON .traj file below <root>/<run>/traj/<instance_id>/.
+    trajectory_dir = root / run / "traj" / instance_id
+    candidates = sorted(trajectory_dir.glob("*.traj"))
+    return candidates[0] if candidates else None
+
+
+def load_trajectory_facts(path: Path | None) -> dict:
+    # Missing or malformed trajectories provide no evidence and must not become failures.
+    facts = {
+        "trajectory_available": False,
+        "trajectory_submitted": False,
+        "trajectory_tool_error_count": 0,
+        "trajectory_timeout_or_turn_limit": False,
+    }
+    if path is None:
+        return facts
+    try:
+        data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    except (json.JSONDecodeError, OSError):
+        return facts
+    if not isinstance(data, dict) or not isinstance(data.get("trajectory"), list):
+        return facts
+
+    facts["trajectory_available"] = True
+    info = data.get("info") if isinstance(data.get("info"), dict) else {}
+    exit_status = str(info.get("exit_status") or "").strip().lower()
+    steps = [step for step in data["trajectory"] if isinstance(step, dict)]
+
+    # A recorded submission is stronger evidence than requiring an explicit final action:
+    # SWE-Agent may autosubmit after a budget or environment termination.
+    facts["trajectory_submitted"] = bool(info.get("submission")) or exit_status.startswith("submitted")
+    if not facts["trajectory_submitted"]:
+        facts["trajectory_submitted"] = any(
+            str(step.get("action") or "").strip().lower().split(maxsplit=1)[0:1] == ["submit"]
+            for step in steps
+        )
+
+    error_steps = 0
+    for step in steps:
+        # Observations are command/tool results. Thoughts and responses often quote issue
+        # text or source code and would create many false positives.
+        if not str(step.get("action") or "").strip():
+            continue
+        observation = str(step.get("observation") or "")
+        if any(pattern.search(observation) for pattern in TOOL_ERROR_PATTERNS):
+            error_steps += 1
+    if any(marker in exit_status for marker in ("exit_error", "exit_format", "exit_command_timeout")):
+        error_steps += 1
+    facts["trajectory_tool_error_count"] = error_steps
+
+    termination_text = " ".join(
+        [exit_status]
+        + [
+            str(step.get(field) or "")
+            for step in steps[-1:]
+            for field in ("response", "thought", "observation")
+        ]
+    )
+    facts["trajectory_timeout_or_turn_limit"] = (
+        any(marker in exit_status for marker in ("exit_cost", "exit_context", "exit_command_timeout"))
+        or any(pattern.search(termination_text) for pattern in TERMINATION_PATTERNS)
+    )
+    return facts
+
+
 def bool_cell(value: bool) -> str:
     return "1" if value else "0"
 
 
-def build_attempt_facts(attempt_dir: Path, dataset_row: dict) -> dict:
+def build_attempt_facts(attempt_dir: Path, dataset_row: dict, trajectory_path: Path | None = None) -> dict:
     # Build all reusable facts before running individual signal checks.
     # Facts are deliberately mechanical so detector functions remain small and auditable.
     gold_patch = dataset_row.get("patch") or ""
@@ -263,6 +363,7 @@ def build_attempt_facts(attempt_dir: Path, dataset_row: dict) -> dict:
     generated_files = patch_files(generated_patch)
     generated_loc = changed_line_count(generated_patch)
     output_facts = load_output_facts(output_path)
+    trajectory_facts = load_trajectory_facts(trajectory_path)
     # File overlap is computed against the gold patch, not against issue text guesses.
     overlap = gold_files & generated_files
     missing_gold = gold_files - generated_files
@@ -274,7 +375,7 @@ def build_attempt_facts(attempt_dir: Path, dataset_row: dict) -> dict:
     failed_fail_to_pass = fail_to_pass & output_facts["failed_test_names"]
     failed_pass_to_pass = pass_to_pass & output_facts["failed_test_names"]
 
-    return {
+    facts = {
         "patch_path": patch_path,
         "output_path": output_path,
         "gold_files": gold_files,
@@ -294,6 +395,8 @@ def build_attempt_facts(attempt_dir: Path, dataset_row: dict) -> dict:
         "failed_fail_to_pass": failed_fail_to_pass,
         "failed_pass_to_pass": failed_pass_to_pass,
     }
+    facts.update(trajectory_facts)
+    return facts
 
 
 ##########################################
@@ -399,6 +502,16 @@ def detect_test_target_signals(facts: dict) -> dict[str, bool]:
     }
 
 
+def detect_trajectory_signals(facts: dict) -> dict[str, bool]:
+    # Trajectory absence is an artifact gap, not proof of agent behavior.
+    available = facts["trajectory_available"]
+    return {
+        "trajectory_no_submission": available and not facts["trajectory_submitted"],
+        "trajectory_tool_error": available and facts["trajectory_tool_error_count"] > 0,
+        "trajectory_timeout_or_turn_limit": available and facts["trajectory_timeout_or_turn_limit"],
+    }
+
+
 def detect_result_mismatch_signals(facts: dict) -> dict[str, bool]:
     # This narrow mismatch catches passed-looking output marked unresolved officially.
     resolved = facts.get("resolved")
@@ -423,6 +536,7 @@ def detect_signals(facts: dict) -> dict[str, bool]:
     signals.update(detect_patch_size_signals(facts))
     signals.update(detect_file_type_signals(facts))
     signals.update(detect_test_target_signals(facts))
+    signals.update(detect_trajectory_signals(facts))
     signals.update(detect_result_mismatch_signals(facts))
     return signals
 
@@ -435,9 +549,10 @@ def analyze_attempt(
     attempt_dir: Path,
     dataset_row: dict,
     result_map: dict[str, bool] | None,
+    trajectory_path: Path | None = None,
 ) -> dict[str, str]:
     # Compare the reference patch and generated patch using simple path/LOC facts.
-    facts = build_attempt_facts(attempt_dir, dataset_row)
+    facts = build_attempt_facts(attempt_dir, dataset_row, trajectory_path)
 
     # Eval output is a signal source, but only official maps label success/failure.
     resolved = result_map.get(instance_id) if result_map and instance_id in result_map else None
@@ -458,6 +573,8 @@ def analyze_attempt(
         "extra_file_count": str(len(facts["extra_files"])),
         "failed_fail_to_pass_count": str(len(facts["failed_fail_to_pass"])),
         "failed_pass_to_pass_count": str(len(facts["failed_pass_to_pass"])),
+        "trajectory_available": bool_cell(facts["trajectory_available"]),
+        "trajectory_tool_error_count": str(facts["trajectory_tool_error_count"]),
     }
     row.update({signal: bool_cell(value) for signal, value in signals.items()})
     return row
@@ -494,18 +611,34 @@ def main() -> None:
     parser.add_argument("--dataset", default="helper_code/sweap_eval_full_v2.jsonl")
     parser.add_argument("--eval-root", default="traj_s3/eval_only")
     parser.add_argument("--results-root", default="traj")
+    parser.add_argument(
+        "--trajectory-root",
+        default=None,
+        help="Root containing <run>/traj/<instance_id> (defaults to --eval-root)",
+    )
     parser.add_argument("--out", default="analysis/failure_signals.csv")
     parser.add_argument("--summary-out", default="analysis/failure_signal_summary.csv")
     args = parser.parse_args()
 
     dataset = load_dataset(Path(args.dataset))
     result_maps = load_result_maps(Path(args.results_root))
+    trajectory_root = Path(args.trajectory_root) if args.trajectory_root else Path(args.eval_root)
     rows = []
     # Skip attempts whose instance_id is not in the public benchmark JSONL.
     for run, instance_id, attempt_dir in iter_attempt_dirs(Path(args.eval_root)):
         if instance_id not in dataset:
             continue
-        rows.append(analyze_attempt(run, instance_id, attempt_dir, dataset[instance_id], result_maps.get(run)))
+        trajectory_path = find_trajectory_path(trajectory_root, run, instance_id)
+        rows.append(
+            analyze_attempt(
+                run,
+                instance_id,
+                attempt_dir,
+                dataset[instance_id],
+                result_maps.get(run),
+                trajectory_path,
+            )
+        )
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
