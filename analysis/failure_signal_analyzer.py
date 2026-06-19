@@ -9,10 +9,16 @@ import json
 import re
 from pathlib import Path
 
+try:
+    from analysis.patch_application_checker import GitApplyChecker
+except ModuleNotFoundError:  # Support `python analysis/failure_signal_analyzer.py`.
+    from patch_application_checker import GitApplyChecker
+
 
 SIGNALS = [
     "no_patch",
     "empty_or_tiny_patch",
+    "patch_application_or_editing_failure",
     "test_failure_available",
     "missing_output",
     "wrong_files_touched",
@@ -53,6 +59,8 @@ FIELDNAMES = [
     "extra_file_count",
     "failed_fail_to_pass_count",
     "failed_pass_to_pass_count",
+    "patch_application_check_available",
+    "patch_application_error_type",
     "trajectory_available",
     "trajectory_tool_error_count",
     *SIGNALS,
@@ -348,7 +356,12 @@ def bool_cell(value: bool) -> str:
     return "1" if value else "0"
 
 
-def build_attempt_facts(attempt_dir: Path, dataset_row: dict, trajectory_path: Path | None = None) -> dict:
+def build_attempt_facts(
+    attempt_dir: Path,
+    dataset_row: dict,
+    trajectory_path: Path | None = None,
+    apply_checker: GitApplyChecker | None = None,
+) -> dict:
     # Build all reusable facts before running individual signal checks.
     # Facts are deliberately mechanical so detector functions remain small and auditable.
     gold_patch = dataset_row.get("patch") or ""
@@ -364,6 +377,15 @@ def build_attempt_facts(attempt_dir: Path, dataset_row: dict, trajectory_path: P
     generated_loc = changed_line_count(generated_patch)
     output_facts = load_output_facts(output_path)
     trajectory_facts = load_trajectory_facts(trajectory_path)
+    application_facts = (
+        apply_checker.check(dataset_row, patch_path.exists(), generated_patch)
+        if apply_checker
+        else {
+            "patch_application_check_available": False,
+            "patch_application_failed": False,
+            "patch_application_error_type": "check_not_configured",
+        }
+    )
     # File overlap is computed against the gold patch, not against issue text guesses.
     overlap = gold_files & generated_files
     missing_gold = gold_files - generated_files
@@ -396,6 +418,7 @@ def build_attempt_facts(attempt_dir: Path, dataset_row: dict, trajectory_path: P
         "failed_pass_to_pass": failed_pass_to_pass,
     }
     facts.update(trajectory_facts)
+    facts.update(application_facts)
     return facts
 
 
@@ -411,6 +434,10 @@ def detect_patch_presence_signals(facts: dict) -> dict[str, bool]:
         "no_patch": no_patch,
         # empty_or_tiny_patch fires for any present patch below 10 changed lines.
         "empty_or_tiny_patch": (not no_patch) and facts["generated_loc"] < 10,
+        # Only definitive parser/index failures emit this signal; infrastructure gaps remain unavailable.
+        "patch_application_or_editing_failure": (
+            facts["patch_application_check_available"] and facts["patch_application_failed"]
+        ),
     }
 
 
@@ -550,9 +577,10 @@ def analyze_attempt(
     dataset_row: dict,
     result_map: dict[str, bool] | None,
     trajectory_path: Path | None = None,
+    apply_checker: GitApplyChecker | None = None,
 ) -> dict[str, str]:
     # Compare the reference patch and generated patch using simple path/LOC facts.
-    facts = build_attempt_facts(attempt_dir, dataset_row, trajectory_path)
+    facts = build_attempt_facts(attempt_dir, dataset_row, trajectory_path, apply_checker)
 
     # Eval output is a signal source, but only official maps label success/failure.
     resolved = result_map.get(instance_id) if result_map and instance_id in result_map else None
@@ -573,6 +601,8 @@ def analyze_attempt(
         "extra_file_count": str(len(facts["extra_files"])),
         "failed_fail_to_pass_count": str(len(facts["failed_fail_to_pass"])),
         "failed_pass_to_pass_count": str(len(facts["failed_pass_to_pass"])),
+        "patch_application_check_available": bool_cell(facts["patch_application_check_available"]),
+        "patch_application_error_type": facts["patch_application_error_type"],
         "trajectory_available": bool_cell(facts["trajectory_available"]),
         "trajectory_tool_error_count": str(facts["trajectory_tool_error_count"]),
     }
@@ -616,6 +646,11 @@ def main() -> None:
         default=None,
         help="Root containing <run>/traj/<instance_id> (defaults to --eval-root)",
     )
+    parser.add_argument(
+        "--repos-root",
+        default="analysis/repos",
+        help="Root containing bare owner__repo.git clones for patch application checks",
+    )
     parser.add_argument("--out", default="analysis/failure_signals.csv")
     parser.add_argument("--summary-out", default="analysis/failure_signal_summary.csv")
     args = parser.parse_args()
@@ -623,6 +658,7 @@ def main() -> None:
     dataset = load_dataset(Path(args.dataset))
     result_maps = load_result_maps(Path(args.results_root))
     trajectory_root = Path(args.trajectory_root) if args.trajectory_root else Path(args.eval_root)
+    apply_checker = GitApplyChecker(Path(args.repos_root))
     rows = []
     # Skip attempts whose instance_id is not in the public benchmark JSONL.
     for run, instance_id, attempt_dir in iter_attempt_dirs(Path(args.eval_root)):
@@ -637,6 +673,7 @@ def main() -> None:
                 dataset[instance_id],
                 result_maps.get(run),
                 trajectory_path,
+                apply_checker,
             )
         )
 

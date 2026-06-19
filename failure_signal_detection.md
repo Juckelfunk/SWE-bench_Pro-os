@@ -10,6 +10,8 @@ The important distinction is:
 Current implementation:
 
 - Script: `analysis/failure_signal_analyzer.py`
+- Patch checker: `analysis/patch_application_checker.py`
+- Repository setup: `analysis/prepare_failure_analysis_repos.py`
 - Detailed output: `analysis/failure_signals.csv`
 - Summary output: `analysis/failure_signal_summary.csv`
 - Scope: low-to-medium-complexity mechanical signals, including structured trajectory termination and tool-error signals.
@@ -17,6 +19,8 @@ Current implementation:
 - Path policy: `tests_only_patch` is strict and only uses benchmark `test_patch` files; `production_code_not_touched` is broader and also treats obvious test paths, docs, and generated/vendor files as non-production.
 - Trajectory path: use `--trajectory-root` for a root containing `<run>/traj/<instance_id>/*.traj`; it defaults to `--eval-root`.
 - Missing or malformed trajectories set `trajectory_available=0` and do not emit behavioral trajectory signals.
+- Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 analysis/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and audit all base commits.
+- Missing repositories or base commits set `patch_application_check_available=0`; they do not emit `patch_application_or_editing_failure`.
 
 ## Mechanical Failure Signals
 
@@ -24,7 +28,7 @@ Current implementation:
 |---|---|---|---|---|---|
 | [x] | `no_patch` | No generated patch artifact exists for the attempt. | Agent artifacts | Very high | Low |
 | [x] | `empty_or_tiny_patch` | Generated patch is empty or below a small LOC threshold. | Generated patch | Very high | Low |
-| [ ] | `patch_application_or_editing_failure` | Patch is malformed, cannot be applied, or produces mechanically inconsistent edits. | Generated patch, base repo | High | Medium |
+| [x] | `patch_application_or_editing_failure` | Patch is malformed, cannot be applied, or produces mechanically inconsistent edits. | Generated patch, base repo | High | Medium |
 | [x] | `syntax_or_parse_error` | Eval output reports syntax, parse, import, compile, or equivalent language-level failure. | Eval output/logs | High if logs are structured | Medium |
 | [x] | `test_failure_available` | Public eval output contains at least one failed test. | Eval output | Very high | Low |
 | [x] | `missing_output` | No eval output artifact is available for the attempt. | Eval artifacts | Very high | Low |
@@ -58,6 +62,10 @@ Current implementation:
 | [x] | `eval_passed_but_result_false_mismatch` | Eval output appears successful but the result map marks the instance unresolved. | Eval result map, eval output | High for mismatch detection | Medium |
 
 ## Reviewed Failure Causes
+
+These remain separate candidate-cause outputs. The implemented mechanical
+`patch_application_or_editing_failure` signal does not by itself mark the
+identically named reviewed-cause output as implemented.
 
 | Implemented | Cause | Meaning | Deterministic detection status | Best mechanical evidence | Detection robustness | Script complexity |
 |---|---|---|---|---|---|---|
@@ -106,7 +114,7 @@ Common preprocessing:
 |---|---|
 | `no_patch` | Check whether the generated patch file exists and is non-empty. Emit if the file is missing. |
 | `empty_or_tiny_patch` | Count changed LOC in the generated patch. Emit if changed LOC is `0` or below a fixed threshold such as `<10`. Keep the threshold configurable. |
-| `patch_application_or_editing_failure` | Apply the generated patch to a clean checkout of `base_commit` with `git apply --check` or equivalent. Emit if application fails. Also emit if the patch contains malformed diff headers, impossible paths, or files that cannot be parsed after patch application. |
+| `patch_application_or_editing_failure` | Strip binary sections exactly as the evaluator does, parse the generated patch with `git apply --numstat`, load `base_commit` into a temporary index backed by the repository's bare clone, and run `git apply --cached --check`. Emit for empty, malformed, context-mismatched, missing-path, or conflicting patches. Record unavailable repositories/commits separately instead of treating infrastructure gaps as patch failures. |
 | `syntax_or_parse_error` | Search structured eval output and logs for language-specific syntax/compile/import markers. Prefer parser-specific fields if available; otherwise match patterns such as `SyntaxError`, `ParseError`, `ImportError`, `TS2304`, `Compilation failed`, `go test` compile errors, etc. |
 | `test_failure_available` | Parse `_output.json`; emit if any test object has status other than `PASSED`. If only logs exist, detect known test framework failure markers. |
 | `missing_output` | Emit if `_output.json` and relevant stdout/stderr logs are absent or unreadable for the attempt. |
