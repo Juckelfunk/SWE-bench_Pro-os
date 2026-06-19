@@ -174,3 +174,7 @@ cython_debug/
 
 # Trajectory downloads
 traj_s3/
+
+# Failure-analysis repository cache and generated availability manifest
+analysis/repos/
+analysis/repo_availability.json
