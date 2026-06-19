@@ -21,6 +21,8 @@ Current implementation:
 - Missing or malformed trajectories set `trajectory_available=0` and do not emit behavioral trajectory signals.
 - Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 analysis/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and audit all base commits.
 - Missing repositories or base commits set `patch_application_check_available=0`; they do not emit `patch_application_or_editing_failure`.
+- CLI progress is printed every 100 attempts by default; configure the interval with `--progress-every N` or disable it with `--progress-every 0`.
+- Use `--skip-trajectory-signals` to avoid loading trajectory files and `--skip-repo-checks` to avoid repository-backed patch application checks.
 
 ## Mechanical Failure Signals
 

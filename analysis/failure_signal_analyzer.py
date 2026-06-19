@@ -7,6 +7,7 @@ import argparse
 import csv
 import json
 import re
+import time
 from pathlib import Path
 
 try:
@@ -356,6 +357,24 @@ def bool_cell(value: bool) -> str:
     return "1" if value else "0"
 
 
+def format_duration(seconds: float) -> str:
+    total_seconds = max(0, int(seconds))
+    hours, remainder = divmod(total_seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def print_progress(completed: int, total: int, started_at: float) -> None:
+    elapsed = time.monotonic() - started_at
+    remaining = (elapsed / completed) * (total - completed) if completed else 0
+    percent = (completed / total) * 100 if total else 100
+    print(
+        f"[{completed}/{total}] {percent:5.1f}% | "
+        f"elapsed {format_duration(elapsed)} | ETA {format_duration(remaining)}",
+        flush=True,
+    )
+
+
 def build_attempt_facts(
     attempt_dir: Path,
     dataset_row: dict,
@@ -651,20 +670,67 @@ def main() -> None:
         default="analysis/repos",
         help="Root containing bare owner__repo.git clones for patch application checks",
     )
+    parser.add_argument(
+        "--skip-trajectory-signals",
+        action="store_true",
+        help="Skip loading trajectories and emit no trajectory-based signals",
+    )
+    parser.add_argument(
+        "--skip-repo-checks",
+        action="store_true",
+        help="Skip repository-backed patch application checks",
+    )
     parser.add_argument("--out", default="analysis/failure_signals.csv")
     parser.add_argument("--summary-out", default="analysis/failure_signal_summary.csv")
+    parser.add_argument(
+        "--progress-every",
+        type=int,
+        default=100,
+        help="Print progress every N attempts; use 0 to disable",
+    )
     args = parser.parse_args()
+
+    if args.progress_every < 0:
+        parser.error("--progress-every must be zero or greater")
 
     dataset = load_dataset(Path(args.dataset))
     result_maps = load_result_maps(Path(args.results_root))
     trajectory_root = Path(args.trajectory_root) if args.trajectory_root else Path(args.eval_root)
-    apply_checker = GitApplyChecker(Path(args.repos_root))
+    apply_checker = None if args.skip_repo_checks else GitApplyChecker(Path(args.repos_root))
+    attempts = list(iter_attempt_dirs(Path(args.eval_root)))
+    run_counts: dict[str, int] = {}
+    for run, _instance_id, _attempt_dir in attempts:
+        run_counts[run] = run_counts.get(run, 0) + 1
+
     rows = []
+    started_at = time.monotonic()
+    print(f"Analyzing {len(attempts)} attempts across {len(run_counts)} runs...", flush=True)
+    if args.skip_trajectory_signals:
+        print("Trajectory signals: skipped", flush=True)
+    if args.skip_repo_checks:
+        print("Repository-backed checks: skipped", flush=True)
+    current_run = None
+    run_number = 0
     # Skip attempts whose instance_id is not in the public benchmark JSONL.
-    for run, instance_id, attempt_dir in iter_attempt_dirs(Path(args.eval_root)):
+    for attempt_number, (run, instance_id, attempt_dir) in enumerate(attempts, start=1):
+        if run != current_run:
+            current_run = run
+            run_number += 1
+            print(
+                f"Run {run_number}/{len(run_counts)}: {run} ({run_counts[run]} attempts)",
+                flush=True,
+            )
         if instance_id not in dataset:
+            if args.progress_every and (
+                attempt_number % args.progress_every == 0 or attempt_number == len(attempts)
+            ):
+                print_progress(attempt_number, len(attempts), started_at)
             continue
-        trajectory_path = find_trajectory_path(trajectory_root, run, instance_id)
+        trajectory_path = (
+            None
+            if args.skip_trajectory_signals
+            else find_trajectory_path(trajectory_root, run, instance_id)
+        )
         rows.append(
             analyze_attempt(
                 run,
@@ -676,6 +742,10 @@ def main() -> None:
                 apply_checker,
             )
         )
+        if args.progress_every and (
+            attempt_number % args.progress_every == 0 or attempt_number == len(attempts)
+        ):
+            print_progress(attempt_number, len(attempts), started_at)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -684,6 +754,13 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     write_summary(rows, Path(args.summary_out))
+    print(
+        f"Completed {len(rows)} analyzed attempts in "
+        f"{format_duration(time.monotonic() - started_at)}.",
+        flush=True,
+    )
+    print(f"Detailed output: {out_path}", flush=True)
+    print(f"Summary output: {args.summary_out}", flush=True)
 
 
 if __name__ == "__main__":
