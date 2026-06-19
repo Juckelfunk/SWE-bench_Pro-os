@@ -23,6 +23,7 @@ Current implementation:
 - Missing repositories or base commits set `patch_application_check_available=0`; they do not emit `patch_application_or_editing_failure`.
 - CLI progress is printed every 100 attempts by default; configure the interval with `--progress-every N` or disable it with `--progress-every 0`.
 - Use `--skip-trajectory-signals` to avoid loading trajectory files and `--skip-repo-checks` to avoid repository-backed patch application checks.
+- Attempts are sequential by default; use `--workers N` to process attempts in parallel while the parent process retains progress reporting and CSV writes.
 
 ## Mechanical Failure Signals
 

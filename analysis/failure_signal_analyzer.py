@@ -8,6 +8,7 @@ import csv
 import json
 import re
 import time
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 try:
@@ -629,6 +630,43 @@ def analyze_attempt(
     return row
 
 
+_WORKER_DATASET = {}
+_WORKER_RESULT_MAPS = {}
+_WORKER_TRAJECTORY_ROOT = None
+_WORKER_APPLY_CHECKER = None
+
+
+def initialize_worker(
+    dataset: dict,
+    result_maps: dict,
+    trajectory_root: str | None,
+    repos_root: str | None,
+) -> None:
+    global _WORKER_DATASET, _WORKER_RESULT_MAPS, _WORKER_TRAJECTORY_ROOT, _WORKER_APPLY_CHECKER
+    _WORKER_DATASET = dataset
+    _WORKER_RESULT_MAPS = result_maps
+    _WORKER_TRAJECTORY_ROOT = Path(trajectory_root) if trajectory_root else None
+    _WORKER_APPLY_CHECKER = GitApplyChecker(Path(repos_root)) if repos_root else None
+
+
+def analyze_attempt_worker(job: tuple[str, str, Path]) -> dict[str, str]:
+    run, instance_id, attempt_dir = job
+    trajectory_path = (
+        find_trajectory_path(_WORKER_TRAJECTORY_ROOT, run, instance_id)
+        if _WORKER_TRAJECTORY_ROOT
+        else None
+    )
+    return analyze_attempt(
+        run,
+        instance_id,
+        attempt_dir,
+        _WORKER_DATASET[instance_id],
+        _WORKER_RESULT_MAPS.get(run),
+        trajectory_path,
+        _WORKER_APPLY_CHECKER,
+    )
+
+
 def iter_attempt_dirs(eval_root: Path):
     # The S3 eval-only sync layout is <root>/<run>/eval/<instance_id>/.
     for eval_dir in sorted(eval_root.glob("*/eval")):
@@ -688,64 +726,61 @@ def main() -> None:
         default=100,
         help="Print progress every N attempts; use 0 to disable",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Number of parallel attempt workers",
+    )
     args = parser.parse_args()
 
     if args.progress_every < 0:
         parser.error("--progress-every must be zero or greater")
+    if args.workers < 1:
+        parser.error("--workers must be one or greater")
 
     dataset = load_dataset(Path(args.dataset))
     result_maps = load_result_maps(Path(args.results_root))
     trajectory_root = Path(args.trajectory_root) if args.trajectory_root else Path(args.eval_root)
-    apply_checker = None if args.skip_repo_checks else GitApplyChecker(Path(args.repos_root))
     attempts = list(iter_attempt_dirs(Path(args.eval_root)))
+    jobs = [attempt for attempt in attempts if attempt[1] in dataset]
     run_counts: dict[str, int] = {}
-    for run, _instance_id, _attempt_dir in attempts:
+    for run, _instance_id, _attempt_dir in jobs:
         run_counts[run] = run_counts.get(run, 0) + 1
 
     rows = []
     started_at = time.monotonic()
-    print(f"Analyzing {len(attempts)} attempts across {len(run_counts)} runs...", flush=True)
+    print(f"Analyzing {len(jobs)} attempts across {len(run_counts)} runs...", flush=True)
+    print(f"Workers: {args.workers}", flush=True)
     if args.skip_trajectory_signals:
         print("Trajectory signals: skipped", flush=True)
     if args.skip_repo_checks:
         print("Repository-backed checks: skipped", flush=True)
-    current_run = None
-    run_number = 0
-    # Skip attempts whose instance_id is not in the public benchmark JSONL.
-    for attempt_number, (run, instance_id, attempt_dir) in enumerate(attempts, start=1):
-        if run != current_run:
-            current_run = run
-            run_number += 1
-            print(
-                f"Run {run_number}/{len(run_counts)}: {run} ({run_counts[run]} attempts)",
-                flush=True,
-            )
-        if instance_id not in dataset:
+    worker_trajectory_root = None if args.skip_trajectory_signals else str(trajectory_root)
+    worker_repos_root = None if args.skip_repo_checks else args.repos_root
+    initialize_worker(dataset, result_maps, worker_trajectory_root, worker_repos_root)
+
+    if args.workers == 1:
+        result_iterator = map(analyze_attempt_worker, jobs)
+        executor = None
+    else:
+        executor = ProcessPoolExecutor(
+            max_workers=args.workers,
+            initializer=initialize_worker,
+            initargs=(dataset, result_maps, worker_trajectory_root, worker_repos_root),
+        )
+        result_iterator = executor.map(analyze_attempt_worker, jobs)
+
+    try:
+        for attempt_number, row in enumerate(result_iterator, start=1):
+            rows.append(row)
             if args.progress_every and (
-                attempt_number % args.progress_every == 0 or attempt_number == len(attempts)
+                attempt_number % args.progress_every == 0 or attempt_number == len(jobs)
             ):
-                print_progress(attempt_number, len(attempts), started_at)
-            continue
-        trajectory_path = (
-            None
-            if args.skip_trajectory_signals
-            else find_trajectory_path(trajectory_root, run, instance_id)
-        )
-        rows.append(
-            analyze_attempt(
-                run,
-                instance_id,
-                attempt_dir,
-                dataset[instance_id],
-                result_maps.get(run),
-                trajectory_path,
-                apply_checker,
-            )
-        )
-        if args.progress_every and (
-            attempt_number % args.progress_every == 0 or attempt_number == len(attempts)
-        ):
-            print_progress(attempt_number, len(attempts), started_at)
+                print_progress(attempt_number, len(jobs), started_at)
+    finally:
+        if executor:
+            executor.shutdown(cancel_futures=True)
 
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
