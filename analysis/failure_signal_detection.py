@@ -64,6 +64,24 @@ FIELDNAMES = [
     *SIGNALS,
 ]
 
+TINY_PATCH_CHANGED_LOC_THRESHOLD = 10
+
+TOO_SMALL_GOLD_LOC_MINIMUM = 20
+TOO_SMALL_GENERATED_LOC_MINIMUM = 10
+TOO_SMALL_GENERATED_TO_GOLD_LOC_RATIO = 0.25
+
+TOO_LARGE_GENERATED_LOC_MINIMUM = 50
+TOO_LARGE_GENERATED_TO_GOLD_LOC_RATIO = 3
+
+LARGE_REFACTOR_FILE_COUNT_RATIO = 2
+LARGE_REFACTOR_EXTRA_FILE_COUNT_MINIMUM = 5
+LARGE_REFACTOR_CHANGED_LOC_MINIMUM = 500
+LARGE_REFACTOR_GENERATED_TO_GOLD_LOC_RATIO = 4
+
+MULTI_FILE_PATCH_FILE_COUNT_THRESHOLD = 1
+SINGLE_FILE_PATCH_FILE_COUNT = 1
+TOOL_ERROR_COUNT_THRESHOLD = 0
+
 SYNTAX_ERROR_PATTERNS = [
     "syntaxerror",
     "parseerror",
@@ -418,8 +436,8 @@ def detect_patch_presence_signals(facts: dict) -> dict[str, bool]:
         # no_patch means the artifact is absent in the eval directory.
         "no_patch": no_patch,
 
-        # empty_or_tiny_patch fires for any present patch below 10 changed lines.
-        "empty_or_tiny_patch": (not no_patch) and facts["generated_loc"] < 10,
+        # empty_or_tiny_patch fires for any present patch below the configured changed-line threshold.
+        "empty_or_tiny_patch": (not no_patch) and facts["generated_loc"] < TINY_PATCH_CHANGED_LOC_THRESHOLD,
 
         # Only definitive parser/index failures emit this signal; infrastructure gaps remain unavailable.
         "patch_application_or_editing_failure": (
@@ -474,15 +492,30 @@ def detect_patch_size_signals(facts: dict) -> dict[str, bool]:
     generated_files = facts["generated_files"]
     return {
         # Too-small patches are only flagged when the gold patch is large enough to compare.
-        "generated_patch_too_small": gold_loc >= 20 and generated_loc < max(10, int(0.25 * gold_loc)),
+        "generated_patch_too_small": (
+            gold_loc >= TOO_SMALL_GOLD_LOC_MINIMUM
+            and generated_loc < max(
+                TOO_SMALL_GENERATED_LOC_MINIMUM,
+                int(TOO_SMALL_GENERATED_TO_GOLD_LOC_RATIO * gold_loc),
+            )
+        ),
         
         # Too-large patches use both a ratio threshold and an absolute minimum.
-        "generated_patch_too_large": generated_loc > max(50, 3 * gold_loc),
+        "generated_patch_too_large": generated_loc > max(
+            TOO_LARGE_GENERATED_LOC_MINIMUM,
+            TOO_LARGE_GENERATED_TO_GOLD_LOC_RATIO * gold_loc,
+        ),
         
         # large_refactor catches broad file churn or very large LOC churn.
         "large_refactor": (
-            len(generated_files) > max(2 * len(gold_files), len(gold_files) + 5)
-            or generated_loc > max(500, 4 * gold_loc)
+            len(generated_files) > max(
+                LARGE_REFACTOR_FILE_COUNT_RATIO * len(gold_files),
+                len(gold_files) + LARGE_REFACTOR_EXTRA_FILE_COUNT_MINIMUM,
+            )
+            or generated_loc > max(
+                LARGE_REFACTOR_CHANGED_LOC_MINIMUM,
+                LARGE_REFACTOR_GENERATED_TO_GOLD_LOC_RATIO * gold_loc,
+            )
         ),
     }
 
@@ -493,13 +526,13 @@ def detect_file_type_signals(facts: dict) -> dict[str, bool]:
     test_files = facts["test_files"]
     return {
         # multi_file_gold_patch describes task shape, not generated patch behavior.
-        "multi_file_gold_patch": len(facts["gold_files"]) > 1,
+        "multi_file_gold_patch": len(facts["gold_files"]) > MULTI_FILE_PATCH_FILE_COUNT_THRESHOLD,
 
         # single_file_gold_patch is useful for separating simple-looking gold patches.
-        "single_file_gold_patch": len(facts["gold_files"]) == 1,
+        "single_file_gold_patch": len(facts["gold_files"]) == SINGLE_FILE_PATCH_FILE_COUNT,
 
         # generated_patch_multi_file describes how broad the generated edit is.
-        "generated_patch_multi_file": len(generated_files) > 1,
+        "generated_patch_multi_file": len(generated_files) > MULTI_FILE_PATCH_FILE_COUNT_THRESHOLD,
 
         # tests_only_patch is strict: generated files must be a subset of benchmark test_patch files.
         "tests_only_patch": bool(generated_files) and bool(test_files) and generated_files <= test_files,
@@ -537,7 +570,7 @@ def detect_trajectory_signals(facts: dict) -> dict[str, bool]:
     available = facts["trajectory_available"]
     return {
         "trajectory_no_submission": available and not facts["trajectory_submitted"],
-        "trajectory_tool_error": available and facts["trajectory_tool_error_count"] > 0,
+        "trajectory_tool_error": available and facts["trajectory_tool_error_count"] > TOOL_ERROR_COUNT_THRESHOLD,
         "trajectory_timeout_or_turn_limit": available and facts["trajectory_timeout_or_turn_limit"],
     }
 
