@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import json
 import re
+import ast
+import shlex
 from pathlib import Path
 
 try:
@@ -35,12 +37,17 @@ SIGNALS = [
     "syntax_or_parse_error",
     "production_code_not_touched",
     "generated_or_vendor_churn",
+    "required_interface_missing",
     "required_test_target_still_failing",
     "regression_test_failed",
     "new_tests_not_exercised_or_missing_output",
     "trajectory_no_submission",
+    "trajectory_stuck_loop",
     "trajectory_tool_error",
     "trajectory_timeout_or_turn_limit",
+    "trajectory_never_opened_gold_files",
+    "trajectory_opened_but_did_not_edit_gold_files",
+    "trajectory_edited_wrong_subsystem",
     "eval_passed_but_result_false_mismatch",
 ]
 
@@ -81,6 +88,8 @@ LARGE_REFACTOR_GENERATED_TO_GOLD_LOC_RATIO = 4
 MULTI_FILE_PATCH_FILE_COUNT_THRESHOLD = 1
 SINGLE_FILE_PATCH_FILE_COUNT = 1
 TOOL_ERROR_COUNT_THRESHOLD = 0
+TRAJECTORY_STUCK_LOOP_REPEAT_THRESHOLD = 5
+TRAJECTORY_WRONG_SUBSYSTEM_MINIMUM_EDITED_FILES = 2
 
 SYNTAX_ERROR_PATTERNS = [
     "syntaxerror",
@@ -111,6 +120,21 @@ TOOL_ERROR_PATTERNS = [
         r"\binvalid tool (?:call|arguments?)\b",
     )
 ]
+
+# Match repo-like paths in shell/editor actions, including SWE-Agent's /app prefix.
+PATH_TOKEN_RE = re.compile(r"(?:/app/|\.?/)?[A-Za-z0-9_.@+-]+(?:/[A-Za-z0-9_.@+-]+)+")
+
+# Match explicit edited-file snapshot markers emitted by some trajectory metadata.
+FILE_MARKER_RE = re.compile(r"\[File:\s*([^\]]+)\]")
+
+# Match named interfaces from structured problem-statement sections.
+INTERFACE_NAME_RE = re.compile(r"\bName:\s*([A-Za-z_][\w.$:-]*)")
+
+# Match backticked code symbols or paths mentioned as required interfaces.
+BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][\w.$:-]*|\S+/\S+)`")
+
+# Match HTTP method plus route pairs from API-oriented problem statements.
+ENDPOINT_RE = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}:-]+)")
 
 TERMINATION_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
@@ -150,10 +174,13 @@ def patch_files(text: str) -> set[str]:
     current_old = None
     for line in text.splitlines():
         if line.startswith("diff --git "):
-            parts = line.split()
+            try:
+                parts = shlex.split(line)
+            except ValueError:
+                parts = line.split()
             if len(parts) >= 4:
                 for raw in parts[2:4]:
-                    path = raw[2:] if raw.startswith(("a/", "b/")) else raw
+                    path = clean_patch_path(raw)
                     if path != "/dev/null":
                         files.add(path)
 
@@ -172,9 +199,8 @@ def patch_files(text: str) -> set[str]:
 
 
 def clean_patch_path(path: str) -> str:
-    # Normalize diff paths like a/foo.py and b/foo.py to foo.py.
+    # Normalize diff paths like a/foo.py and b/foo.py while preserving spaces.
     path = path.split("\t", 1)[0]
-    path = path.split(" ", 1)[0]
     return path[2:] if path.startswith(("a/", "b/")) else path
 
 
@@ -184,13 +210,92 @@ def normalize_test_name(name: str) -> str:
 
 
 def normalize_dataset_tests(value: object) -> set[str]:
-    # Dataset test fields are expected to be lists, but tolerate strings.
+    # Dataset test fields may be real lists or serialized list strings.
     # Empty or malformed fields become an empty set so detectors stay conservative.
     if isinstance(value, list):
         return {normalize_test_name(item) for item in value if normalize_test_name(item)}
     if isinstance(value, str) and value.strip():
+        try:
+            parsed = ast.literal_eval(value)
+        except (SyntaxError, ValueError):
+            parsed = None
+        if isinstance(parsed, list):
+            return {normalize_test_name(item) for item in parsed if normalize_test_name(item)}
         return {normalize_test_name(value)}
     return set()
+
+
+def normalize_problem_statement(text: str) -> str:
+    # Some rows keep an extra quote wrapper and escaped newlines inside the parsed string.
+    stripped = str(text or "").strip()
+    if stripped.startswith('"') and stripped.endswith('"'):
+        stripped = stripped[1:-1]
+    return stripped.replace("\\n", "\n").replace('\\"', '"')
+
+
+def extract_required_interfaces(problem_statement: str) -> set[str]:
+    # Prefer explicit benchmark interface metadata over guessing from prose.
+    text = normalize_problem_statement(problem_statement)
+    interfaces = set(INTERFACE_NAME_RE.findall(text))
+    interfaces.update(ENDPOINT_RE.findall(text))
+
+    for symbol in BACKTICK_SYMBOL_RE.findall(text):
+        # Keep backticked code-like names, but ignore ordinary quoted words.
+        if "." in symbol or "/" in symbol or "_" in symbol or symbol[:1].isupper():
+            interfaces.add(symbol)
+    return {item.strip() for item in interfaces if item.strip()}
+
+
+def interface_present_in_patch(interface: str, patch: str) -> bool:
+    # Full names are strongest; suffixes catch common implementations like db.mget -> mget.
+    if interface in patch:
+        return True
+    suffix = interface.rsplit(".", 1)[-1].rsplit(":", 1)[-1]
+    return suffix != interface and re.search(rf"\b{re.escape(suffix)}\b", patch) is not None
+
+
+def normalize_repo_path(path: str) -> str:
+    # Trajectory tools often use /app paths; generated patches use repo-relative paths.
+    path = str(path or "").replace("\\", "/").strip().strip("'\"`,:;()[]{}")
+    path = re.sub(r"/+", "/", path)
+    path = path.split("#", 1)[0]
+    if re.match(r"^[A-Za-z]:/", path):
+        path = path[3:]
+    path = re.sub(r":\d+$", "", path)
+    if path.startswith("/app/"):
+        path = path[5:]
+    elif path == "/app":
+        path = ""
+    while path.startswith("./"):
+        path = path[2:]
+    return path.strip("/")
+
+
+def extract_paths_from_text(text: str) -> set[str]:
+    # This intentionally accepts broad path-looking tokens and normalizes later.
+    paths = {normalize_repo_path(match) for match in PATH_TOKEN_RE.findall(str(text or ""))}
+    paths.update(normalize_repo_path(match) for match in FILE_MARKER_RE.findall(str(text or "")))
+    return {path for path in paths if path and not path.startswith(".git/")}
+
+
+def extract_paths_from_action(action: str) -> set[str]:
+    # Editor commands can embed full file contents; keep only the command portion.
+    command = str(action or "").split("--file_text", 1)[0]
+    return extract_paths_from_text(command)
+
+
+def extract_file_markers(text: str) -> set[str]:
+    # Edited-file snapshots use explicit [File: path] markers before file contents.
+    return {
+        path
+        for path in (normalize_repo_path(match) for match in FILE_MARKER_RE.findall(str(text or "")))
+        if path
+    }
+
+
+def path_subsystems(paths: set[str]) -> set[str]:
+    # Top-level directories are a simple subsystem proxy across mixed repositories.
+    return {path.split("/", 1)[0] for path in paths if "/" in path}
 
 
 def is_docs_path(path: str) -> bool:
@@ -297,6 +402,9 @@ def load_trajectory_facts(path: Path | None) -> dict:
         "trajectory_submitted": False,
         "trajectory_tool_error_count": 0,
         "trajectory_timeout_or_turn_limit": False,
+        "trajectory_opened_files": set(),
+        "trajectory_edited_files": set(),
+        "trajectory_max_repeated_action": 0,
     }
     if path is None:
         return facts
@@ -324,10 +432,33 @@ def load_trajectory_facts(path: Path | None) -> dict:
         )
 
     error_steps = 0
+    repeated_count = 0
+    previous_fingerprint = None
     for step in steps:
+        action = str(step.get("action") or "").strip()
+        action_lower = action.lower()
+        action_paths = extract_paths_from_action(action)
+        first_word = action_lower.split(maxsplit=1)[0] if action_lower else ""
+
+        # Track file reads from common shell/editor actions; thoughts are deliberately ignored.
+        if first_word in {"cat", "sed", "grep", "rg", "head", "tail", "nl", "less"} or " view " in f" {action_lower} ":
+            facts["trajectory_opened_files"].update(action_paths)
+        if any(word in action_lower for word in ("str_replace_editor", "apply_patch", " create ", " edit ", " replace ")):
+            facts["trajectory_edited_files"].update(action_paths)
+
+        # Consecutive identical command/path fingerprints are a simple stuck-loop signal.
+        fingerprint_paths = sorted(action_paths)
+        fingerprint = (first_word, fingerprint_paths[0] if fingerprint_paths else action_lower[:80])
+        if action_lower and fingerprint == previous_fingerprint:
+            repeated_count += 1
+        else:
+            repeated_count = 1 if action_lower else 0
+            previous_fingerprint = fingerprint if action_lower else None
+        facts["trajectory_max_repeated_action"] = max(facts["trajectory_max_repeated_action"], repeated_count)
+
         # Observations are command/tool results. Thoughts and responses often quote issue
         # text or source code and would create many false positives.
-        if not str(step.get("action") or "").strip():
+        if not action:
             continue
         observation = str(step.get("observation") or "")
         if any(pattern.search(observation) for pattern in TOOL_ERROR_PATTERNS):
@@ -336,6 +467,11 @@ def load_trajectory_facts(path: Path | None) -> dict:
     if any(marker in exit_status for marker in ("exit_error", "exit_format", "exit_command_timeout")):
         error_steps += 1
     facts["trajectory_tool_error_count"] = error_steps
+
+    # SWE-Agent sometimes stores edited file snapshots in info instead of action names.
+    for key, value in info.items():
+        if str(key).startswith("edited_files"):
+            facts["trajectory_edited_files"].update(extract_file_markers(str(value)))
 
     termination_text = " ".join(
         [exit_status]
@@ -369,6 +505,7 @@ def build_attempt_facts(
     gold_files = patch_files(gold_patch)
     test_files = patch_files(test_patch)
     gold_loc = changed_line_count(gold_patch)
+    required_interfaces = extract_required_interfaces(dataset_row.get("problem_statement") or "")
 
     patch_path = attempt_dir / "_patch.diff"
     output_path = attempt_dir / "_output.json"
@@ -399,6 +536,11 @@ def build_attempt_facts(
     # Exact normalized intersections avoid fuzzy matching false positives.
     failed_fail_to_pass = fail_to_pass & output_facts["failed_test_names"]
     failed_pass_to_pass = pass_to_pass & output_facts["failed_test_names"]
+    missing_required_interfaces = {
+        interface
+        for interface in required_interfaces
+        if not interface_present_in_patch(interface, generated_patch)
+    }
 
     facts = {
         "patch_path": patch_path,
@@ -408,6 +550,8 @@ def build_attempt_facts(
         "generated_files": generated_files,
         "gold_loc": gold_loc,
         "generated_loc": generated_loc,
+        "required_interfaces": required_interfaces,
+        "missing_required_interfaces": missing_required_interfaces,
         "overlap": overlap,
         "missing_gold": missing_gold,
         "extra_files": extra_files,
@@ -548,6 +692,14 @@ def detect_file_type_signals(facts: dict) -> dict[str, bool]:
     }
 
 
+def detect_required_interface_signals(facts: dict) -> dict[str, bool]:
+    # Emit only when the problem names explicit interfaces and the patch misses at least one.
+    return {
+        "required_interface_missing": bool(facts["required_interfaces"])
+        and bool(facts["missing_required_interfaces"]),
+    }
+
+
 def detect_test_target_signals(facts: dict) -> dict[str, bool]:
     # FAIL_TO_PASS/PASS_TO_PASS names come from the benchmark row and are matched exactly after normalization.
     output_missing = facts["failed_tests"] is None
@@ -568,10 +720,31 @@ def detect_test_target_signals(facts: dict) -> dict[str, bool]:
 def detect_trajectory_signals(facts: dict) -> dict[str, bool]:
     # Trajectory absence is an artifact gap, not proof of agent behavior.
     available = facts["trajectory_available"]
+    opened_files = facts.get("trajectory_opened_files", set())
+    edited_files = facts.get("trajectory_edited_files", set())
+    gold_files = facts.get("gold_files", set())
+    generated_files = facts.get("generated_files", set())
+    opened_gold = opened_files & gold_files
+    edited_or_generated = edited_files | generated_files
+    gold_subsystems = path_subsystems(gold_files)
+    edited_subsystems = path_subsystems(edited_or_generated)
     return {
         "trajectory_no_submission": available and not facts["trajectory_submitted"],
+        "trajectory_stuck_loop": available and facts["trajectory_max_repeated_action"] >= TRAJECTORY_STUCK_LOOP_REPEAT_THRESHOLD,
         "trajectory_tool_error": available and facts["trajectory_tool_error_count"] > TOOL_ERROR_COUNT_THRESHOLD,
         "trajectory_timeout_or_turn_limit": available and facts["trajectory_timeout_or_turn_limit"],
+        # Require at least one extracted read path so missing parser coverage stays neutral.
+        "trajectory_never_opened_gold_files": available and bool(gold_files) and bool(opened_files) and not opened_gold,
+        "trajectory_opened_but_did_not_edit_gold_files": available and bool(opened_gold) and not (opened_gold & generated_files),
+        # This is intentionally a subsystem heuristic, not a semantic wrong-solution verdict.
+        "trajectory_edited_wrong_subsystem": (
+            available
+            and bool(gold_subsystems)
+            and len(edited_or_generated) >= TRAJECTORY_WRONG_SUBSYSTEM_MINIMUM_EDITED_FILES
+            and bool(edited_subsystems)
+            and not (edited_or_generated & gold_files)
+            and edited_subsystems.isdisjoint(gold_subsystems)
+        ),
     }
 
 
@@ -598,6 +771,7 @@ def detect_signals(facts: dict) -> dict[str, bool]:
     signals.update(detect_file_overlap_signals(facts))
     signals.update(detect_patch_size_signals(facts))
     signals.update(detect_file_type_signals(facts))
+    signals.update(detect_required_interface_signals(facts))
     signals.update(detect_test_target_signals(facts))
     signals.update(detect_trajectory_signals(facts))
     signals.update(detect_result_mismatch_signals(facts))

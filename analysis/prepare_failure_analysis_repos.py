@@ -16,6 +16,7 @@ except ModuleNotFoundError:  # Support direct script execution.
 
 
 def load_repositories(dataset_path: Path) -> dict[str, set[str]]:
+    # Group base commits by repository to avoid cloning the same origin repeatedly.
     repositories: dict[str, set[str]] = defaultdict(set)
     with dataset_path.open(encoding="utf-8") as dataset_file:
         for line in dataset_file:
@@ -29,6 +30,7 @@ def run_git(args: list[str]) -> subprocess.CompletedProcess:
 
 
 def prepare_repository(repo: str, commits: set[str], repos_root: Path) -> dict:
+    # Store each upstream as a bare mirror-like cache keyed by its benchmark repo name.
     repo_path = repos_root / repo_storage_name(repo)
     clone_url = f"https://github.com/{repo}.git"
     if repo_path.exists():
@@ -81,6 +83,7 @@ def main() -> None:
     repositories = load_repositories(Path(args.dataset))
     results = []
     for repo, commits in sorted(repositories.items()):
+        # Process repositories deterministically so manifest diffs stay easy to review.
         print(f"Preparing {repo} ({len(commits)} base commits)...", flush=True)
         result = prepare_repository(repo, commits, repos_root)
         results.append(result)

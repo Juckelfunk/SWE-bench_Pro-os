@@ -29,6 +29,7 @@ def repo_storage_name(repo: str) -> str:
 
 
 def normalize_apply_error(stderr: str) -> str:
+    # Collapse Git's varied wording into stable failure categories for reports.
     lower = stderr.lower()
     if "corrupt patch" in lower or "no valid patches" in lower or "unrecognized input" in lower:
         return "malformed_patch"
@@ -56,6 +57,7 @@ class GitApplyChecker:
         )
 
     def check(self, dataset_row: dict, patch_exists: bool, patch: str) -> dict:
+        # Start with a conservative unavailable result until each prerequisite is proven.
         facts = {
             "patch_application_check_available": False,
             "patch_application_failed": False,
@@ -95,6 +97,7 @@ class GitApplyChecker:
                     patch_application_error_type="malformed_patch",
                 )
                 return facts
+
             # Repository gaps are infrastructure evidence, not model-editing failures.
             if not git_dir.exists():
                 facts["patch_application_error_type"] = "repository_unavailable"
