@@ -14,6 +14,7 @@ Current implementation:
 - Repository setup: `analysis/prepare_failure_analysis_repos.py`
 - Detailed output: `analysis/output/failure_signals.csv`
 - Summary output: `analysis/output/failure_signal_summary.csv`
+- Markdown report: `analysis/output/failure_signal_report.md`, including overall, per-model/run, and per-repository signal breakdowns.
 - Scope: low-to-medium-complexity mechanical signals, including explicit interface checks and structured trajectory signals.
 - Validation: signal failure rates are computed only where an official `traj/*/eval_results.json` result map is available.
 - Path policy: `tests_only_patch` is strict and only uses benchmark `test_patch` files; `production_code_not_touched` is broader and also treats obvious test paths, docs, and generated/vendor files as non-production.

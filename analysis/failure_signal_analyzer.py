@@ -135,6 +135,76 @@ def write_summary(rows: list[dict[str, str]], path: Path) -> None:
             f.write(f"{signal},{len(present)},{len(present_failed)},{rate}\n")
 
 
+def signal_stats(rows: list[dict[str, str]]) -> list[tuple[str, int, int, int, str]]:
+    # Count all signal hits, but compute failure rates only where official results exist.
+    stats = []
+    for signal in SIGNALS:
+        present = [row for row in rows if row[signal] == "1"]
+        present_known = [row for row in present if row["resolved"] != ""]
+        present_failed = [row for row in present_known if row["resolved"] == "0"]
+        rate = "" if not present_known else f"{len(present_failed) / len(present_known):.4f}"
+        stats.append((signal, len(present), len(present_known), len(present_failed), rate))
+    return stats
+
+
+def write_signal_table(f, rows: list[dict[str, str]], limit: int | None = None) -> None:
+    f.write("| Signal | Attempts | Attempts with result | Failed attempts | Failure rate |\n")
+    f.write("|---|---:|---:|---:|---:|\n")
+    stats = sorted(signal_stats(rows), key=lambda item: (-item[1], item[0]))
+    for signal, attempts, known_attempts, failed_attempts, rate in stats[:limit]:
+        f.write(f"| `{signal}` | {attempts} | {known_attempts} | {failed_attempts} | {rate} |\n")
+
+
+def group_rows(rows: list[dict[str, str]], field: str) -> dict[str, list[dict[str, str]]]:
+    groups: dict[str, list[dict[str, str]]] = {}
+    for row in rows:
+        key = row.get(field) or "(unknown)"
+        groups.setdefault(key, []).append(row)
+    return groups
+
+
+def write_group_overview(f, groups: dict[str, list[dict[str, str]]]) -> None:
+    f.write("| Group | Attempts | Attempts with result | Failed attempts | Failure rate |\n")
+    f.write("|---|---:|---:|---:|---:|\n")
+    for group, rows in sorted(groups.items(), key=lambda item: (-len(item[1]), item[0])):
+        resolved_known = [row for row in rows if row["resolved"] != ""]
+        failed = [row for row in resolved_known if row["resolved"] == "0"]
+        rate = "" if not resolved_known else f"{len(failed) / len(resolved_known):.4f}"
+        f.write(f"| `{group}` | {len(rows)} | {len(resolved_known)} | {len(failed)} | {rate} |\n")
+
+
+def write_markdown_report(rows: list[dict[str, str]], path: Path) -> None:
+    # The Markdown report mirrors the CSV summary and adds model/run and repo breakdowns.
+    total = len(rows)
+    resolved_known = [row for row in rows if row["resolved"] != ""]
+    failed = [row for row in resolved_known if row["resolved"] == "0"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        f.write("# Failure Signal Report\n\n")
+        f.write("## Overall\n\n")
+        f.write(f"- Attempts: {total}\n")
+        f.write(f"- Attempts with result: {len(resolved_known)}\n")
+        f.write(f"- Failed attempts: {len(failed)}\n")
+        if resolved_known:
+            f.write(f"- Baseline failure rate: {len(failed) / len(resolved_known):.4f}\n")
+        f.write("\n")
+        write_signal_table(f, rows)
+
+        run_groups = group_rows(rows, "run")
+        f.write("\n## By Model/Run\n\n")
+        write_group_overview(f, run_groups)
+        for run, run_rows in sorted(run_groups.items(), key=lambda item: (-len(item[1]), item[0])):
+            f.write(f"\n### `{run}`\n\n")
+            write_signal_table(f, run_rows, limit=10)
+
+        repo_groups = group_rows(rows, "repo")
+        f.write("\n## By Repository\n\n")
+        write_group_overview(f, repo_groups)
+        for repo, repo_rows in sorted(repo_groups.items(), key=lambda item: (-len(item[1]), item[0])):
+            f.write(f"\n### `{repo}`\n\n")
+            write_signal_table(f, repo_rows, limit=10)
+
+
 def main() -> None:
     # Defaults match the repository layout used by the S3 download helper.
     parser = argparse.ArgumentParser(description=__doc__)
@@ -163,6 +233,7 @@ def main() -> None:
     )
     parser.add_argument("--out", default="analysis/output/failure_signals.csv")
     parser.add_argument("--summary-out", default="analysis/output/failure_signal_summary.csv")
+    parser.add_argument("--report-out", default="analysis/output/failure_signal_report.md")
     parser.add_argument(
         "--progress-every",
         type=int,
@@ -232,6 +303,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
     write_summary(rows, Path(args.summary_out))
+    write_markdown_report(rows, Path(args.report_out))
     print(
         f"Completed {len(rows)} analyzed attempts in "
         f"{format_duration(time.monotonic() - started_at)}.",
@@ -239,6 +311,7 @@ def main() -> None:
     )
     print(f"Detailed output: {out_path}", flush=True)
     print(f"Summary output: {args.summary_out}", flush=True)
+    print(f"Markdown report: {args.report_out}", flush=True)
 
 
 if __name__ == "__main__":
