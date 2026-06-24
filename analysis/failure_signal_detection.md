@@ -12,8 +12,8 @@ Current implementation:
 - Script: `analysis/failure_signal_analyzer.py`
 - Patch checker: `analysis/patch_application_checker.py`
 - Repository setup: `analysis/prepare_failure_analysis_repos.py`
-- Detailed output: `analysis/failure_signals.csv`
-- Summary output: `analysis/failure_signal_summary.csv`
+- Detailed output: `analysis/output/failure_signals.csv`
+- Summary output: `analysis/output/failure_signal_summary.csv`
 - Scope: low-to-medium-complexity mechanical signals, including explicit interface checks and structured trajectory signals.
 - Validation: signal failure rates are computed only where an official `traj/*/eval_results.json` result map is available.
 - Path policy: `tests_only_patch` is strict and only uses benchmark `test_patch` files; `production_code_not_touched` is broader and also treats obvious test paths, docs, and generated/vendor files as non-production.
@@ -21,7 +21,7 @@ Current implementation:
 - Required-interface extraction is conservative: it uses explicit `Name:` fields, backticked symbols, and HTTP routes from the problem statement, and should be read as medium-confidence evidence rather than semantic proof.
 - Trajectory path: use `--trajectory-root` for a root containing `<run>/traj/<instance_id>/*.traj`; it defaults to `--eval-root`.
 - Missing or malformed trajectories set `trajectory_available=0` and do not emit behavioral trajectory signals.
-- Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 analysis/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and audit all base commits.
+- Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 analysis/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and write `analysis/output/repo_availability.json`.
 - Missing repositories or base commits set `patch_application_check_available=0`; they do not emit `patch_application_or_editing_failure`.
 - CLI progress is printed every 100 attempts by default; configure the interval with `--progress-every N` or disable it with `--progress-every 0`.
 - Use `--skip-trajectory-signals` to avoid loading trajectory files and `--skip-repo-checks` to avoid repository-backed patch application checks.

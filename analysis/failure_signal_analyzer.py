@@ -161,8 +161,8 @@ def main() -> None:
         action="store_true",
         help="Skip repository-backed patch application checks",
     )
-    parser.add_argument("--out", default="analysis/failure_signals.csv")
-    parser.add_argument("--summary-out", default="analysis/failure_signal_summary.csv")
+    parser.add_argument("--out", default="analysis/output/failure_signals.csv")
+    parser.add_argument("--summary-out", default="analysis/output/failure_signal_summary.csv")
     parser.add_argument(
         "--progress-every",
         type=int,

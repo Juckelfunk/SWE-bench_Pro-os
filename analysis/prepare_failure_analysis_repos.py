@@ -75,7 +75,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="helper_code/sweap_eval_full_v2.jsonl")
     parser.add_argument("--repos-root", default="analysis/repos")
-    parser.add_argument("--manifest", default="analysis/repo_availability.json")
+    parser.add_argument("--manifest", default="analysis/output/repo_availability.json")
     args = parser.parse_args()
 
     repos_root = Path(args.repos_root)
