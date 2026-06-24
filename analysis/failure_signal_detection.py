@@ -54,6 +54,7 @@ SIGNALS = [
 FIELDNAMES = [
     "run",
     "instance_id",
+    "repo",
     "resolved",
     "gold_files",
     "generated_files",
@@ -92,18 +93,20 @@ TRAJECTORY_STUCK_LOOP_REPEAT_THRESHOLD = 5
 TRAJECTORY_WRONG_SUBSYSTEM_MINIMUM_EDITED_FILES = 2
 
 SYNTAX_ERROR_PATTERNS = [
-    "syntaxerror",
-    "parseerror",
-    "compilation failed",
-    "compile error",
-    "cannot compile",
-    "importerror",
-    "module not found",
-    "ts2304",
-    "ts2322",
-    "ts2339",
-    "error: cannot find symbol",
-    "undefined reference",
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        r"\bSyntaxError:",
+        r"\bParseError:",
+        r"\bImportError:",
+        r"\bModuleNotFoundError:",
+        r"\bcompilation failed\b",
+        r"\bcompile error\b",
+        r"\bcannot compile\b",
+        r"\bmodule not found\b",
+        r"\berror TS\d{4}:",
+        r"\berror: cannot find symbol\b",
+        r"\bundefined reference\b",
+    )
 ]
 
 TOOL_ERROR_PATTERNS = [
@@ -275,7 +278,15 @@ def extract_paths_from_text(text: str) -> set[str]:
     # This intentionally accepts broad path-looking tokens and normalizes later.
     paths = {normalize_repo_path(match) for match in PATH_TOKEN_RE.findall(str(text or ""))}
     paths.update(normalize_repo_path(match) for match in FILE_MARKER_RE.findall(str(text or "")))
-    return {path for path in paths if path and not path.startswith(".git/")}
+    return {path for path in paths if is_plausible_extracted_path(path)}
+
+
+def is_plausible_extracted_path(path: str) -> bool:
+    # Keep this narrow: reject obvious value ranges without guessing repo language rules.
+    if not path or path.startswith(".git/"):
+        return False
+    parts = path.split("/")
+    return not any(part in {"min", "max", "-inf", "+inf"} for part in parts)
 
 
 def extract_paths_from_action(action: str) -> set[str]:
@@ -354,7 +365,9 @@ def load_output_facts(path: Path) -> dict:
         "failed_tests": None,
         "failed_test_names": set(),
         "seen_test_names": set(),
+        "test_count": None,
         "output_text": "",
+        "failed_output_text": "",
     }
 
     if not path.exists():
@@ -371,15 +384,26 @@ def load_output_facts(path: Path) -> dict:
         return facts
 
     # Status comparison is strict: anything other than PASSED is a failing test.
+    failed_text_chunks = []
     for test in tests:
+        if not isinstance(test, dict):
+            continue
         name = normalize_test_name(test.get("name", ""))
         if not name:
             continue
         facts["seen_test_names"].add(name)
         if test.get("status") != "PASSED":
             facts["failed_test_names"].add(name)
+            # Keep failure diagnostics, but do not treat the test name itself as error text.
+            failed_text_chunks.extend(
+                str(value)
+                for key, value in test.items()
+                if key != "name" and isinstance(value, str)
+            )
 
+    facts["test_count"] = len(tests)
     facts["failed_tests"] = bool(facts["failed_test_names"])
+    facts["failed_output_text"] = "\n".join(failed_text_chunks)
     return facts
 
 
@@ -395,6 +419,11 @@ def read_attempt_text(attempt_dir: Path, output_text: str) -> str:
     return "\n".join(chunks)
 
 
+def syntax_error_evidence(text: str) -> bool:
+    # Require diagnostic-looking text so test names like test_importerror do not match.
+    return any(pattern.search(str(text or "")) for pattern in SYNTAX_ERROR_PATTERNS)
+
+
 def load_trajectory_facts(path: Path | None) -> dict:
     # Missing or malformed trajectories provide no evidence and must not become failures.
     facts = {
@@ -405,6 +434,7 @@ def load_trajectory_facts(path: Path | None) -> dict:
         "trajectory_opened_files": set(),
         "trajectory_edited_files": set(),
         "trajectory_max_repeated_action": 0,
+        "trajectory_diagnostic_text": "",
     }
     if path is None:
         return facts
@@ -432,6 +462,7 @@ def load_trajectory_facts(path: Path | None) -> dict:
         )
 
     error_steps = 0
+    diagnostic_chunks = []
     repeated_count = 0
     previous_fingerprint = None
     for step in steps:
@@ -461,12 +492,15 @@ def load_trajectory_facts(path: Path | None) -> dict:
         if not action:
             continue
         observation = str(step.get("observation") or "")
+        if syntax_error_evidence(observation):
+            diagnostic_chunks.append(observation)
         if any(pattern.search(observation) for pattern in TOOL_ERROR_PATTERNS):
             error_steps += 1
             
     if any(marker in exit_status for marker in ("exit_error", "exit_format", "exit_command_timeout")):
         error_steps += 1
     facts["trajectory_tool_error_count"] = error_steps
+    facts["trajectory_diagnostic_text"] = "\n".join(diagnostic_chunks)
 
     # SWE-Agent sometimes stores edited file snapshots in info instead of action names.
     for key, value in info.items():
@@ -556,9 +590,11 @@ def build_attempt_facts(
         "missing_gold": missing_gold,
         "extra_files": extra_files,
         "failed_tests": output_facts["failed_tests"],
+        "test_count": output_facts["test_count"],
         "seen_test_names": output_facts["seen_test_names"],
         "failed_test_names": output_facts["failed_test_names"],
-        "attempt_text": read_attempt_text(attempt_dir, output_facts["output_text"]),
+        "attempt_text": read_attempt_text(attempt_dir, output_facts["failed_output_text"]),
+        "trajectory_diagnostic_text": trajectory_facts["trajectory_diagnostic_text"],
         "fail_to_pass": fail_to_pass,
         "pass_to_pass": pass_to_pass,
         "failed_fail_to_pass": failed_fail_to_pass,
@@ -592,7 +628,8 @@ def detect_patch_presence_signals(facts: dict) -> dict[str, bool]:
 
 def detect_eval_output_signals(facts: dict) -> dict[str, bool]:
     # Eval output is used only for observable test-failure signals.
-    lower_text = facts["attempt_text"].lower()
+    diagnostic_text = "\n".join([facts["attempt_text"], facts.get("trajectory_diagnostic_text", "")])
+    has_passing_test_results = facts["failed_tests"] is False and facts["test_count"] is not None and facts["test_count"] > 0
     return {
         # test_failure_available fires when structured output has at least one non-PASSED test.
         "test_failure_available": facts["failed_tests"] is True,
@@ -601,7 +638,7 @@ def detect_eval_output_signals(facts: dict) -> dict[str, bool]:
         "missing_output": facts["failed_tests"] is None,
 
         # syntax_or_parse_error uses conservative text markers from output/log files.
-        "syntax_or_parse_error": any(pattern in lower_text for pattern in SYNTAX_ERROR_PATTERNS),
+        "syntax_or_parse_error": (not has_passing_test_results) and syntax_error_evidence(diagnostic_text),
     }
 
 
@@ -752,11 +789,13 @@ def detect_result_mismatch_signals(facts: dict) -> dict[str, bool]:
     # This narrow mismatch catches passed-looking output marked unresolved officially.
     resolved = facts.get("resolved")
     failed_tests = facts["failed_tests"]
+    has_test_results = facts["test_count"] is not None and facts["test_count"] > 0
     return {
         # This does not flag resolved=True with failed output; it only tracks false negatives.
         "eval_passed_but_result_false_mismatch": (
             resolved is not None
             and failed_tests is not None
+            and has_test_results
             and not bool(resolved)
             and not failed_tests
         ),
@@ -804,6 +843,7 @@ def analyze_attempt(
     row = {
         "run": run,
         "instance_id": instance_id,
+        "repo": str(dataset_row.get("repo") or ""),
         "resolved": "" if resolved is None else bool_cell(bool(resolved)),
         "gold_files": str(len(facts["gold_files"])),
         "generated_files": str(len(facts["generated_files"])),
