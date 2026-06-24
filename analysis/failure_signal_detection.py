@@ -136,6 +136,12 @@ INTERFACE_NAME_RE = re.compile(r"\bName:\s*([A-Za-z_][\w.$:-]*)")
 # Match backticked code symbols or paths mentioned as required interfaces.
 BACKTICK_SYMBOL_RE = re.compile(r"`([A-Za-z_][\w.$:-]*|\S+/\S+)`")
 
+# Weak backticked examples often look code-like but are not required interfaces.
+EXAMPLE_CONTEXT_RE = re.compile(
+    r"\b(?:e\.g|example|examples|such as|like|format|formats|input|inputs|invalid|malformed)\b",
+    re.IGNORECASE,
+)
+
 # Match HTTP method plus route pairs from API-oriented problem statements.
 ENDPOINT_RE = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}:-]+)")
 
@@ -239,14 +245,56 @@ def normalize_problem_statement(text: str) -> str:
 def extract_required_interfaces(problem_statement: str) -> set[str]:
     # Prefer explicit benchmark interface metadata over guessing from prose.
     text = normalize_problem_statement(problem_statement)
-    interfaces = set(INTERFACE_NAME_RE.findall(text))
-    interfaces.update(ENDPOINT_RE.findall(text))
+    interfaces = {
+        item
+        for item in INTERFACE_NAME_RE.findall(text)
+        if is_plausible_required_interface(item, strong_source=True)
+    }
+    interfaces.update(
+        item
+        for item in ENDPOINT_RE.findall(text)
+        if is_plausible_required_interface(item, strong_source=True)
+    )
 
-    for symbol in BACKTICK_SYMBOL_RE.findall(text):
-        # Keep backticked code-like names, but ignore ordinary quoted words.
-        if "." in symbol or "/" in symbol or "_" in symbol or symbol[:1].isupper():
-            interfaces.add(symbol)
+    for line in text.splitlines():
+        if EXAMPLE_CONTEXT_RE.search(line):
+            continue
+        for symbol in BACKTICK_SYMBOL_RE.findall(line):
+            # Keep backticked code-like names, but ignore ordinary quoted words.
+            if is_plausible_required_interface(symbol, strong_source=False):
+                interfaces.add(symbol)
     return {item.strip() for item in interfaces if item.strip()}
+
+
+def is_plausible_required_interface(value: str, strong_source: bool) -> bool:
+    # Filter obvious examples/literals without trying to semantically parse prose.
+    symbol = str(value or "").strip().strip(".,;:")
+    lower = symbol.lower()
+    if not symbol:
+        return False
+    if lower.startswith(("http://", "https://")):
+        return False
+    if "<" in symbol or ">" in symbol:
+        return False
+    if symbol in {"True", "False", "None", "NotImplemented"}:
+        return False
+    if symbol.endswith(("Error", "Exception")):
+        return False
+    if symbol.startswith("-") or re.search(r"\d+[hms]", symbol):
+        return False
+    if strong_source:
+        return True
+
+    if "/" in symbol:
+        return not lower.startswith(("example.", "www."))
+    if "." in symbol:
+        parts = symbol.split(".")
+        return not any(part in {"example", "test"} for part in parts)
+    if "_" in symbol:
+        return True
+    if symbol[:1].isupper():
+        return len(symbol) > 3
+    return False
 
 
 def interface_present_in_patch(interface: str, patch: str) -> bool:
