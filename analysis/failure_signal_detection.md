@@ -11,7 +11,7 @@ Current implementation:
 
 - Script: `analysis/failure_signal_analyzer.py`
 - Patch checker: `analysis/patch_application_checker.py`
-- Repository setup: `analysis/prepare_failure_analysis_repos.py`
+- Repository setup: `scripts/prepare_failure_analysis_repos.py`
 - Detailed output: `analysis/output/failure_signals.csv`
 - Summary output: `analysis/output/failure_signal_summary.csv`
 - Markdown report: `analysis/output/failure_signal_report.md`, including overall, per-model/run, and per-repository signal breakdowns.
@@ -22,7 +22,7 @@ Current implementation:
 - Required-interface extraction is conservative: it uses explicit `Name:` fields, HTTP routes, and code-like backticked symbols from the problem statement, while filtering obvious examples, URLs, placeholder paths, literals, and exception names. It should still be read as medium-confidence evidence rather than semantic proof.
 - Trajectory path: use `--trajectory-root` for a root containing `<run>/traj/<instance_id>/*.traj`; it defaults to `--eval-root`.
 - Missing or malformed trajectories set `trajectory_available=0` and do not emit behavioral trajectory signals.
-- Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 analysis/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and write `analysis/output/repo_availability.json`.
+- Patch application checks use full bare clones under `analysis/repos/` by default. Run `python3 scripts/prepare_failure_analysis_repos.py` once to clone the public repositories, fetch dataset commits that are no longer advertised by branch refs, and write `analysis/output/repo_availability.json`.
 - Missing repositories or base commits set `patch_application_check_available=0`; they do not emit `patch_application_or_editing_failure`.
 - CLI progress is printed every 100 attempts by default; configure the interval with `--progress-every N` or disable it with `--progress-every 0`.
 - Use `--skip-trajectory-signals` to avoid loading trajectory files and `--skip-repo-checks` to avoid repository-backed patch application checks.
@@ -106,52 +106,54 @@ Scripts should avoid pretending that semantic root causes are fully deterministi
 }
 ```
 
-## Implementation Plan: Mechanical Failure Signals
+## Current Detection Details: Mechanical Failure Signals
 
 Common preprocessing:
 
 1. Load the benchmark row by `instance_id` from `helper_code/sweap_eval_full_v2.jsonl`.
 2. Parse `patch` as the gold patch and the generated `_patch.diff` as the model patch.
-3. Extract changed files, added/deleted LOC, hunks, file extensions, and top-level path components from both patches.
-4. Load eval artifacts such as `_output.json`, stdout/stderr logs, and result maps.
-5. Load trajectory messages/actions and normalize them into opened files, edited files, tool errors, submit actions, repeated actions, and termination reason.
+3. Extract changed files and changed LOC from both patches.
+4. Load `_output.json`; include sibling `*.log` files only as diagnostic text for syntax/import detection.
+5. Load official result maps from `traj/*/eval_results.json` when available.
+6. Optionally load trajectory messages/actions and normalize them into opened files, edited files, tool errors, submit state, repeated-action counts, diagnostics, and termination state.
+7. Optionally check patch application against bare repository clones under `analysis/repos/`.
 
-| Signal | Implementation plan |
+| Signal | Current detector |
 |---|---|
-| `no_patch` | Check whether the generated patch file exists and is non-empty. Emit if the file is missing. |
-| `empty_or_tiny_patch` | Count changed LOC in the generated patch. Emit if changed LOC is `0` or below a fixed threshold such as `<10`. Keep the threshold configurable. |
-| `patch_application_or_editing_failure` | Strip binary sections exactly as the evaluator does, parse the generated patch with `git apply --numstat`, load `base_commit` into a temporary index backed by the repository's bare clone, and run `git apply --cached --check`. Emit for empty, malformed, context-mismatched, missing-path, or conflicting patches. Record unavailable repositories/commits separately instead of treating infrastructure gaps as patch failures. |
-| `syntax_or_parse_error` | Search failure diagnostics, sibling logs, and trajectory command observations for diagnostic-looking syntax/compile/import markers. Do not match test names alone; examples include `SyntaxError:`, `ParseError:`, `ImportError:`, `ModuleNotFoundError:`, `error TS2339:`, `Compilation failed`, and `error: cannot find symbol`. If structured eval output contains a non-empty all-passed test list, suppress earlier trajectory diagnostics so transient errors fixed before final eval do not count. |
-| `test_failure_available` | Parse `_output.json`; emit if any test object has status other than `PASSED`. If only logs exist, detect known test framework failure markers. |
-| `missing_output` | Emit if `_output.json` and relevant stdout/stderr logs are absent or unreadable for the attempt. |
-| `wrong_files_touched` | Parse file sets from gold and generated patches. Emit if generated file set is non-empty and intersection with gold file set is empty. |
-| `partial_file_overlap` | Emit if intersection with gold files is non-empty but does not cover all gold files. Include missing and touched gold file lists. |
-| `all_gold_files_touched` | Emit if every gold file appears in the generated patch. This is a positive coverage signal, not a failure by itself. |
-| `missing_gold_files` | Emit the exact list `gold_files - generated_files`. Optionally separate production, tests, docs, fixtures, generated files, schemas, and config paths. |
-| `extra_files_touched` | Emit the exact list `generated_files - gold_files`. Summarize by path type and top-level package. |
-| `generated_patch_too_small` | Compute generated LOC and gold LOC. Emit if `gold_loc >= 20` and `generated_loc < max(10, 0.25 * gold_loc)`. Thresholds should be configurable. |
-| `generated_patch_too_large` | Emit if `generated_loc > max(50, 3 * gold_loc)`. Also record file count ratio. |
-| `large_refactor` | Emit if generated file count is greater than `max(2 * gold_file_count, gold_file_count + 5)` or generated LOC is greater than `max(500, 4 * gold_loc)`. |
-| `multi_file_gold_patch` | Emit if gold patch file count is `>1`. |
-| `single_file_gold_patch` | Emit if gold patch file count is `1`. |
-| `generated_patch_multi_file` | Emit if generated patch file count is `>1`. |
-| `production_code_not_touched` | Classify paths with conservative generic rules. Emit if generated patch has no production paths and only touches benchmark test files, obvious test paths, docs, or generated/vendor files. Config/build metadata is intentionally excluded until repo-specific rules exist. |
-| `tests_only_patch` | Parse files from the benchmark `test_patch`. Emit only if every generated path is contained in that `test_patch` file set. No generic path-name fallback is used. |
-| `docs_only_patch` | Emit if every generated path matches docs-only rules, e.g. `docs/`, `doc/`, `README*`, `*.md`, `*.rst`, `*.asciidoc`. |
-| `config_only_patch` | Currently not implemented. A robust version should avoid global filename allowlists and prefer repo-specific path rules plus gold-patch context. Emit only when changed files are explicitly known to be build/CI/tooling metadata for that repo and are not benchmark-relevant gold files. |
-| `generated_or_vendor_churn` | Emit if generated patch touches likely generated/vendor files, e.g. `vendor/`, `dist/`, `build/`, generated API clients, snapshots, lockfiles, minified bundles. Flag as churn if these files are extra relative to gold or dominate changed LOC. |
-| `required_interface_missing` | Extract explicit interfaces from the benchmark row. Prefer names after `Name:` and HTTP method routes. Include code-like backticked symbols only outside example-heavy contexts such as `e.g.`, `examples`, `like`, `format`, or `invalid inputs`. Filter obvious non-interfaces including URLs, `<placeholder>` paths, boolean/null literals, and exception class names. Emit if the generated patch does not contain the full required symbol/path or a method/function suffix such as `db.mget` -> `mget`. |
-| `required_test_target_still_failing` | Normalize `FAIL_TO_PASS` names from the dataset and compare to failed tests in `_output.json`. Emit if any target test is still failing. |
-| `regression_test_failed` | Normalize `PASS_TO_PASS` names and compare to failed tests. Emit if a regression test fails. |
-| `new_tests_not_exercised_or_missing_output` | Emit if `FAIL_TO_PASS` exists but none of those tests appear in output, or if output is missing. This catches incomplete eval artifacts or test-selection problems. |
-| `trajectory_no_submission` | Parse trajectory actions/messages for submit commands, final patch submission, or equivalent terminal action. Emit if no submit action appears before termination. |
-| `trajectory_stuck_loop` | Build fingerprints of consecutive actions: command type, target file/path, search query, or observation hash. Emit if the same or highly similar action repeats beyond a threshold, e.g. `>=5`, without meaningful file changes. |
-| `trajectory_tool_error` | Parse trajectory observations for structured errors and common tool failure patterns: command non-zero exit, file-not-found, patch apply failure, timeout, permission error, JSON/tool schema error. Emit counts and examples. |
-| `trajectory_timeout_or_turn_limit` | Inspect run metadata and final trajectory messages for timeout, max-turn, budget, cost-limit, or termination reason. Emit if present. |
-| `trajectory_never_opened_gold_files` | Extract opened/read file paths from trajectory actions and `[File: ...]` markers. Normalize paths for repo root and leading `./`, reject obvious non-file value ranges such as `min/max`, and emit if extracted opened paths exist but none overlap gold file paths. |
-| `trajectory_opened_but_did_not_edit_gold_files` | Emit if the agent opened/read at least one gold file but generated patch does not modify that file. Useful for distinguishing search failure from edit/implementation failure. |
-| `trajectory_edited_wrong_subsystem` | Compare edited paths in trajectory/generated patch to gold top-level directories/modules. Emit if edits concentrate in different subsystems and gold subsystem is untouched or lightly touched. Keep as heuristic. |
-| `eval_passed_but_result_false_mismatch` | Compare result map boolean to parsed eval output. Emit only when the result map is `false`, `_output.json` contains a non-empty structured test list, and none of those tests failed. Empty `tests: []` is treated as missing evidence, not as passed-looking eval output. |
+| `no_patch` | Emits when `_patch.diff` is absent. A present but empty file is not `no_patch`; it is handled by `empty_or_tiny_patch` and, when repo checks are enabled, `patch_application_or_editing_failure` with `empty_patch`. |
+| `empty_or_tiny_patch` | Counts changed diff lines in the generated patch, ignoring `+++` and `---` headers. Emits for a present patch with changed LOC `< 10`. |
+| `patch_application_or_editing_failure` | Uses `GitApplyChecker` when repo checks are enabled. Binary hunks are stripped, the patch is parsed with `git apply --numstat -z`, then checked against the benchmark `base_commit` in a temporary index with `git apply --cached --check`. Emits only when the check is available and fails. Error types are normalized to `empty_patch`, `malformed_patch`, `context_mismatch`, `missing_path`, `path_conflict`, or `apply_error`; missing repositories or base commits are recorded as unavailable, not failures. |
+| `syntax_or_parse_error` | Searches failed eval diagnostics, sibling `*.log` text, and trajectory observations for syntax/import/compile markers. Patterns checked: `SyntaxError:`, `ParseError:`, `ImportError:`, `ModuleNotFoundError:`, `compilation failed`, `compile error`, `cannot compile`, `module not found`, TypeScript `error TS<digits>:`, Java-like `error: cannot find symbol`, and linker-style `undefined reference`. If `_output.json` contains a non-empty structured test list and every test is `PASSED`, the signal is suppressed so fixed transient trajectory errors do not count. |
+| `test_failure_available` | Parses `_output.json` only. Emits when `tests` is a list and at least one test object has `status != "PASSED"`. There is no log-only fallback for this signal. |
+| `missing_output` | Emits when `_output.json` is absent, unreadable, invalid JSON, or does not contain a list-valued `tests` field. Empty `tests: []` is structured output, not missing output. |
+| `wrong_files_touched` | Parses file sets from gold and generated patches. Emits when generated files are non-empty and have zero intersection with gold files. |
+| `partial_file_overlap` | Emits when generated files intersect gold files but do not cover the full gold file set. |
+| `all_gold_files_touched` | Emits when the gold file set is non-empty and every gold file appears in the generated patch. This is a coverage signal, not a failure by itself. |
+| `missing_gold_files` | Emits when `gold_files - generated_files` is non-empty. The CSV records only the missing count, not the file list. |
+| `extra_files_touched` | Emits when `generated_files - gold_files` is non-empty. The CSV records only the extra count, not the file list. |
+| `generated_patch_too_small` | Emits when `gold_loc >= 20` and `generated_loc < max(10, int(0.25 * gold_loc))`. LOC means changed diff lines excluding file headers. |
+| `generated_patch_too_large` | Emits when `generated_loc > max(50, 3 * gold_loc)`. |
+| `large_refactor` | Emits when generated file count is greater than `max(2 * gold_file_count, gold_file_count + 5)` or generated LOC is greater than `max(500, 4 * gold_loc)`. |
+| `multi_file_gold_patch` | Emits when the gold patch changes more than one file. |
+| `single_file_gold_patch` | Emits when the gold patch changes exactly one file. |
+| `generated_patch_multi_file` | Emits when the generated patch changes more than one file. |
+| `production_code_not_touched` | Emits when generated files are non-empty and every generated file is classified as non-production. Non-production means the path is in benchmark `test_patch`, matches test path patterns, matches docs patterns, or matches generated/vendor patterns. Test path patterns checked: path parts `test`, `tests`, `spec`, `specs`, or `__tests__`; filenames starting with `test_` or `spec_`; filenames ending in `_test.py`, `.test.js`, `.spec.js`, `.test.ts`, `.spec.ts`, `.test.tsx`, or `.spec.tsx`. Config/build metadata is intentionally not treated as non-production. |
+| `tests_only_patch` | Emits only when generated files are non-empty, benchmark `test_patch` contains files, and every generated file is a subset of the benchmark `test_patch` file set. It does not use generic `test/` path-name patterns. |
+| `docs_only_patch` | Emits when generated files are non-empty and every generated path is documentation. Patterns checked: path parts `doc`, `docs`, or `documentation`; root filename starting with `README`; extensions `.md`, `.rst`, `.asciidoc`, or `.adoc`. |
+| `config_only_patch` | Not implemented. No detector emits this signal today. |
+| `generated_or_vendor_churn` | Emits when any generated path looks generated, vendored, bundled, or lockfile-like. Patterns checked: path parts `vendor`, `vendors`, `node_modules`, `dist`, `build`, `coverage`, `generated`, or `gen`; filenames ending in `.min.js`, `.min.css`, `.snap`, or `.lock`; filenames containing `generated`. |
+| `required_interface_missing` | Extracts explicit required interfaces from the problem statement, then emits when at least one extracted interface is absent from the generated patch. Extraction patterns checked: `Name: <symbol>`, HTTP routes after `GET|POST|PUT|PATCH|DELETE`, and backticked code symbols or paths. Backticked symbols are ignored on lines containing example/input context terms: `e.g`, `example(s)`, `such as`, `like`, `format(s)`, `input(s)`, `invalid`, or `malformed`. Filters also reject URLs, `<placeholder>` values, booleans/null-like literals, exception/error class names, negative/range-like values, and weak example-looking symbols. Patch matching accepts either the full interface string or, for dotted/colon names, the final suffix as a word. |
+| `required_test_target_still_failing` | Normalizes `FAIL_TO_PASS` from the dataset and failed test names from `_output.json` with whitespace collapsing. Emits when their exact normalized intersection is non-empty. |
+| `regression_test_failed` | Normalizes `PASS_TO_PASS` and failed test names with whitespace collapsing. Emits when their exact normalized intersection is non-empty. |
+| `new_tests_not_exercised_or_missing_output` | Emits when the dataset has `FAIL_TO_PASS` targets and either output is missing/unstructured or none of those exact normalized target tests appear in `_output.json`. |
+| `trajectory_no_submission` | Requires a valid trajectory. Emits when there is no `info.submission`, `info.exit_status` does not start with `submitted`, and no trajectory action starts with `submit`. |
+| `trajectory_stuck_loop` | Requires a valid trajectory. Builds a consecutive action fingerprint from the first action word plus the first extracted path, or the first 80 lowercased action characters when no path is present. Emits when the same fingerprint repeats at least `5` times consecutively. |
+| `trajectory_tool_error` | Requires a valid trajectory. Counts action observations matching tool-error patterns, plus selected error exit statuses. Patterns checked: `command failed`, `command timed out`, `process/command exited/returned with code <nonzero>`, `non-zero exit/status`, `no such file or directory`, `file not found`, `permission denied`, `tool call/invocation error/failed`, and `invalid tool call/arguments`. Exit statuses containing `exit_error`, `exit_format`, or `exit_command_timeout` add one error. Emits when the count is greater than `0`. |
+| `trajectory_timeout_or_turn_limit` | Requires a valid trajectory. Emits when `info.exit_status` contains `exit_cost`, `exit_context`, or `exit_command_timeout`, or when the final trajectory text matches termination patterns. Patterns checked: cost/token/time/turn/step `limit` or `budget`, `max turns/steps/tokens`, `context window`, `command timeout(s)`, `timed out`, or `timeout`. |
+| `trajectory_never_opened_gold_files` | Requires a valid trajectory, non-empty gold files, and at least one extracted opened path. Opened files come from actions whose first word is `cat`, `sed`, `grep`, `rg`, `head`, `tail`, `nl`, or `less`, or actions containing `view`. Path patterns checked include repo-like slash paths with optional `/app/` or `./` prefixes; `[File: ...]` markers are also supported by the path extractor. Emits when no opened path overlaps a gold file. |
+| `trajectory_opened_but_did_not_edit_gold_files` | Requires a valid trajectory. Emits when at least one extracted opened path overlaps gold files but none of those opened gold files appear in the generated patch file set. |
+| `trajectory_edited_wrong_subsystem` | Requires a valid trajectory. Edited files come from actions containing `str_replace_editor`, `apply_patch`, ` create `, ` edit `, or ` replace `, plus `[File: ...]` markers in `info` keys beginning with `edited_files`, plus generated patch files. Emits when at least `2` edited/generated files exist, none overlap gold files, and edited/generated top-level path components are disjoint from gold top-level path components. |
+| `eval_passed_but_result_false_mismatch` | Emits when an official result map marks the attempt unresolved, `_output.json` has a non-empty structured test list, and none of those tests failed. Empty `tests: []` is not treated as passed-looking evidence. |
 
 ## Implementation Plan: Reviewed Failure Causes
 

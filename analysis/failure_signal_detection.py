@@ -9,10 +9,7 @@ import ast
 import shlex
 from pathlib import Path
 
-try:
-    from analysis.patch_application_checker import GitApplyChecker
-except ModuleNotFoundError:  # Support `python analysis/failure_signal_detection.py`.
-    from patch_application_checker import GitApplyChecker
+from analysis.patch_application_checker import GitApplyChecker
 
 
 SIGNALS = [
@@ -92,6 +89,7 @@ TOOL_ERROR_COUNT_THRESHOLD = 0
 TRAJECTORY_STUCK_LOOP_REPEAT_THRESHOLD = 5
 TRAJECTORY_WRONG_SUBSYSTEM_MINIMUM_EDITED_FILES = 2
 
+# TODO: Might need to add more patterns
 SYNTAX_ERROR_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -109,6 +107,7 @@ SYNTAX_ERROR_PATTERNS = [
     )
 ]
 
+# TODO: Might need to add more patterns
 TOOL_ERROR_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -145,6 +144,7 @@ EXAMPLE_CONTEXT_RE = re.compile(
 # Match HTTP method plus route pairs from API-oriented problem statements.
 ENDPOINT_RE = re.compile(r"\b(?:GET|POST|PUT|PATCH|DELETE)\s+(/[A-Za-z0-9_./{}:-]+)")
 
+# TODO: Might need to add more patterns
 TERMINATION_PATTERNS = [
     re.compile(pattern, re.IGNORECASE)
     for pattern in (
@@ -268,6 +268,7 @@ def extract_required_interfaces(problem_statement: str) -> set[str]:
 
 def is_plausible_required_interface(value: str, strong_source: bool) -> bool:
     # Filter obvious examples/literals without trying to semantically parse prose.
+    # TODO: Might need to add more patterns
     symbol = str(value or "").strip().strip(".,;:")
     lower = symbol.lower()
     if not symbol:
@@ -658,6 +659,13 @@ def build_attempt_facts(
 ##########################################
 
 def detect_patch_presence_signals(facts: dict) -> dict[str, bool]:
+    """Detect patch artifact and mechanical applyability signals.
+
+    Covered signals:
+    - no_patch: the generated patch artifact is missing.
+    - empty_or_tiny_patch: the generated patch exists but changes very little.
+    - patch_application_or_editing_failure: git can parse/check the patch and the check fails.
+    """
     # Patch-presence signals do not need gold-patch comparison.
     no_patch = not facts["patch_path"].exists()
     return {
@@ -675,6 +683,13 @@ def detect_patch_presence_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_eval_output_signals(facts: dict) -> dict[str, bool]:
+    """Detect signals from structured eval output and diagnostic text.
+
+    Covered signals:
+    - test_failure_available: `_output.json` contains at least one non-PASSED test.
+    - missing_output: `_output.json` is absent, invalid, or not shaped like test output.
+    - syntax_or_parse_error: output/log/trajectory diagnostics contain syntax/import/compile markers.
+    """
     # Eval output is used only for observable test-failure signals.
     diagnostic_text = "\n".join([facts["attempt_text"], facts.get("trajectory_diagnostic_text", "")])
     has_passing_test_results = facts["failed_tests"] is False and facts["test_count"] is not None and facts["test_count"] > 0
@@ -691,6 +706,15 @@ def detect_eval_output_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_file_overlap_signals(facts: dict) -> dict[str, bool]:
+    """Compare generated patch files with gold patch files.
+
+    Covered signals:
+    - wrong_files_touched: generated files have no overlap with gold files.
+    - partial_file_overlap: generated files hit some gold files but miss others.
+    - all_gold_files_touched: generated files cover the whole gold file set.
+    - missing_gold_files: at least one gold file is absent from the generated patch.
+    - extra_files_touched: generated patch changes files outside the gold file set.
+    """
     # These signals compare generated paths against reference patch paths.
     gold_files = facts["gold_files"]
     generated_files = facts["generated_files"]
@@ -714,6 +738,13 @@ def detect_file_overlap_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_patch_size_signals(facts: dict) -> dict[str, bool]:
+    """Compare generated patch size against gold patch size.
+
+    Covered signals:
+    - generated_patch_too_small: generated changed LOC is much smaller than gold LOC.
+    - generated_patch_too_large: generated changed LOC is much larger than gold LOC.
+    - large_refactor: generated patch has broad file or LOC churn relative to gold.
+    """
     # Size thresholds mirror the report heuristics and remain configurable later.
     gold_loc = facts["gold_loc"]
     generated_loc = facts["generated_loc"]
@@ -750,6 +781,16 @@ def detect_patch_size_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_file_type_signals(facts: dict) -> dict[str, bool]:
+    """Classify task and generated-patch file types.
+
+    Covered signals:
+    - multi_file_gold_patch / single_file_gold_patch: shape of the reference patch.
+    - generated_patch_multi_file: generated patch touches multiple files.
+    - tests_only_patch: generated files are only benchmark test-patch files.
+    - docs_only_patch: generated files are all documentation paths.
+    - production_code_not_touched: generated files are only tests/docs/generated/vendor paths.
+    - generated_or_vendor_churn: generated patch touches likely generated/vendor/lockfile paths.
+    """
     # test_patch gives benchmark-specific test files; docs remain path-based.
     generated_files = facts["generated_files"]
     test_files = facts["test_files"]
@@ -778,6 +819,12 @@ def detect_file_type_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_required_interface_signals(facts: dict) -> dict[str, bool]:
+    """Detect missing explicit interfaces from the problem statement.
+
+    Covered signal:
+    - required_interface_missing: the issue names an interface/endpoint/symbol and the
+      generated patch contains neither the full name nor an accepted suffix form.
+    """
     # Emit only when the problem names explicit interfaces and the patch misses at least one.
     return {
         "required_interface_missing": bool(facts["required_interfaces"])
@@ -786,6 +833,14 @@ def detect_required_interface_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_test_target_signals(facts: dict) -> dict[str, bool]:
+    """Compare benchmark target/regression tests with structured eval results.
+
+    Covered signals:
+    - required_test_target_still_failing: a FAIL_TO_PASS test is still failing.
+    - regression_test_failed: a PASS_TO_PASS test failed.
+    - new_tests_not_exercised_or_missing_output: FAIL_TO_PASS tests are absent from output
+      or output is missing/unstructured.
+    """
     # FAIL_TO_PASS/PASS_TO_PASS names come from the benchmark row and are matched exactly after normalization.
     output_missing = facts["failed_tests"] is None
     target_tests = facts["fail_to_pass"]
@@ -803,6 +858,17 @@ def detect_test_target_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_trajectory_signals(facts: dict) -> dict[str, bool]:
+    """Detect behavioral signals from parsed agent trajectory data.
+
+    Covered signals:
+    - trajectory_no_submission: no explicit or metadata-recorded submission.
+    - trajectory_stuck_loop: repeated consecutive action fingerprints.
+    - trajectory_tool_error: command/tool error patterns occurred in observations or exit status.
+    - trajectory_timeout_or_turn_limit: exit status or final text indicates budget/timeout limits.
+    - trajectory_never_opened_gold_files: read actions never touched gold files.
+    - trajectory_opened_but_did_not_edit_gold_files: gold files were read but not changed.
+    - trajectory_edited_wrong_subsystem: edits concentrate in top-level paths disjoint from gold.
+    """
     # Trajectory absence is an artifact gap, not proof of agent behavior.
     available = facts["trajectory_available"]
     opened_files = facts.get("trajectory_opened_files", set())
@@ -834,6 +900,12 @@ def detect_trajectory_signals(facts: dict) -> dict[str, bool]:
 
 
 def detect_result_mismatch_signals(facts: dict) -> dict[str, bool]:
+    """Detect mismatches between structured eval output and official result maps.
+
+    Covered signal:
+    - eval_passed_but_result_false_mismatch: tests look passed in `_output.json`, but the
+      official result map marks the attempt unresolved.
+    """
     # This narrow mismatch catches passed-looking output marked unresolved officially.
     resolved = facts.get("resolved")
     failed_tests = facts["failed_tests"]

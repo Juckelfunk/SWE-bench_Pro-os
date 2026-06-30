@@ -5,17 +5,14 @@ from __future__ import annotations
 
 import argparse
 import csv
+import datetime
 import json
 import time
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
-try:
-    from analysis.failure_signal_detection import FIELDNAMES, SIGNALS, analyze_attempt
-    from analysis.patch_application_checker import GitApplyChecker
-except ModuleNotFoundError:  # Support `python analysis/failure_signal_analyzer.py`.
-    from failure_signal_detection import FIELDNAMES, SIGNALS, analyze_attempt
-    from patch_application_checker import GitApplyChecker
+from analysis.failure_signal_detection import FIELDNAMES, SIGNALS, analyze_attempt
+from analysis.patch_application_checker import GitApplyChecker
 
 
 def load_dataset(path: Path) -> dict[str, dict]:
@@ -56,19 +53,13 @@ def find_trajectory_path(root: Path, run: str, instance_id: str) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def format_duration(seconds: float) -> str:
-    total_seconds = max(0, int(seconds))
-    hours, remainder = divmod(total_seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
-
-
 def print_progress(completed: int, total: int, started_at: float) -> None:
     elapsed = time.monotonic() - started_at
+    elapsed_text = str(datetime.timedelta(seconds=max(0, int(elapsed)))).zfill(8)
     percent = (completed / total) * 100 if total else 100
     print(
         f"[{completed}/{total}] {percent:5.1f}% | "
-        f"elapsed {format_duration(elapsed)}",
+        f"elapsed {elapsed_text}",
         flush=True,
     )
 
@@ -85,6 +76,8 @@ def initialize_worker(
     trajectory_root: str | None,
     repos_root: str | None,
 ) -> None:
+    # ProcessPoolExecutor starts separate Python processes. Store the large shared
+    # inputs once per process so each job only needs to pass the run/id/path tuple.
     global _WORKER_DATASET, _WORKER_RESULT_MAPS, _WORKER_TRAJECTORY_ROOT, _WORKER_APPLY_CHECKER
     _WORKER_DATASET = dataset
     _WORKER_RESULT_MAPS = result_maps
@@ -93,6 +86,8 @@ def initialize_worker(
 
 
 def analyze_attempt_worker(job: tuple[str, str, Path]) -> dict[str, str]:
+    # Adapter used by map()/ProcessPoolExecutor: resolve optional per-attempt
+    # artifacts from worker globals, then delegate to the real analyzer.
     run, instance_id, attempt_dir = job
     trajectory_path = (
         find_trajectory_path(_WORKER_TRAJECTORY_ROOT, run, instance_id)
@@ -206,6 +201,7 @@ def write_markdown_report(rows: list[dict[str, str]], path: Path) -> None:
 
 
 def main() -> None:
+    # --- CLI configuration -------------------------------------------------
     # Defaults match the repository layout used by the S3 download helper.
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", default="helper_code/sweap_eval_full_v2.jsonl")
@@ -253,6 +249,7 @@ def main() -> None:
     if args.workers < 1:
         parser.error("--workers must be one or greater")
 
+    # --- Load shared inputs ------------------------------------------------
     dataset = load_dataset(Path(args.dataset))
     result_maps = load_result_maps(Path(args.results_root))
     trajectory_root = Path(args.trajectory_root) if args.trajectory_root else Path(args.eval_root)
@@ -264,6 +261,8 @@ def main() -> None:
 
     rows = []
     started_at = time.monotonic()
+
+    # --- Configure optional signal sources --------------------------------
     print(f"Analyzing {len(jobs)} attempts across {len(run_counts)} runs...", flush=True)
     print(f"Workers: {args.workers}", flush=True)
     if args.skip_trajectory_signals:
@@ -274,6 +273,7 @@ def main() -> None:
     worker_repos_root = None if args.skip_repo_checks else args.repos_root
     initialize_worker(dataset, result_maps, worker_trajectory_root, worker_repos_root)
 
+    # --- Analyze attempts --------------------------------------------------
     if args.workers == 1:
         result_iterator = map(analyze_attempt_worker, jobs)
         executor = None
@@ -296,6 +296,7 @@ def main() -> None:
         if executor:
             executor.shutdown(cancel_futures=True)
 
+    # --- Write outputs -----------------------------------------------------
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -304,9 +305,12 @@ def main() -> None:
         writer.writerows(rows)
     write_summary(rows, Path(args.summary_out))
     write_markdown_report(rows, Path(args.report_out))
+    total_elapsed = str(
+        datetime.timedelta(seconds=max(0, int(time.monotonic() - started_at)))
+    ).zfill(8)
     print(
         f"Completed {len(rows)} analyzed attempts in "
-        f"{format_duration(time.monotonic() - started_at)}.",
+        f"{total_elapsed}.",
         flush=True,
     )
     print(f"Detailed output: {out_path}", flush=True)
